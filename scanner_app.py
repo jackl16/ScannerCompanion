@@ -6,17 +6,15 @@ COM/serial mode, gets read on its own dedicated background thread -- no
 dependency on which window has keyboard focus, and no risk of two
 scanners' input interleaving (each has its own separate connection).
 
-Setup:
-    pip install supabase pyserial tomli_w
-    (tkinter ships with standard Python on Windows -- no separate install needed)
-    Copy scanner_config.example.toml -> scanner_config.toml and fill in real
-    values. Scanner COM ports no longer need to be filled in by hand --
-    use the in-app "Detect Scanner" screen instead (Device Manager -> Ports
-    still works too, if you'd rather set it manually).
-
 Run:
     python scanner_app.py
 """
+
+import requests
+from tkinter import messagebox
+
+CURRENT_VERSION = "1.0.0"
+MANIFEST_URL = "https://raw.githubusercontent.com/jackl16/ScannerCompanion/refs/heads/main/version.json"
 
 import queue
 import threading
@@ -142,7 +140,8 @@ class ScannerApp(tk.Tk):
             self._show_scanner_screen()
         else:
             self._show_login_screen()
-        
+
+        self.after(2000, lambda: self.check_for_updates(silent=True))
         self.after(150, self._load_custom_icon)
     # --- VISUAL STYLE -----------------------------------------------------
     def _load_custom_icon(self):
@@ -243,6 +242,8 @@ class ScannerApp(tk.Tk):
 
 
         help_menu = self._make_menu()
+        help_menu.add_command(label="Check for Updates...", command=lambda: self.check_for_updates(silent=False))
+        help_menu.add_separator()
         help_menu.add_command(label="📖 View Setup Guide", command=self._open_setup_guide)
         help_menu.add_command(label="🔌 Troubleshoot Connection...", command=self._show_troubleshooting_wizard) # New wizard
         help_menu.add_separator()
@@ -522,44 +523,21 @@ class ScannerApp(tk.Tk):
         log_frame.pack(fill="both", expand=True, padx=20, pady=20)
         ttk.Label(log_frame, text="Scan Log", font=(FONT, 10, "bold")).pack(anchor="w")
 
-        # 1. Create your clean log container frame (no more scrollbar widget packed next to it)
         list_container = tk.Frame(log_frame, bg=COLORS["card"])
         list_container.pack(fill="both", expand=True)
-        
-        # 2. Build the main list box directly
+
         self.log_list = tk.Listbox(list_container)
         self._style_listbox(self.log_list)
         self.log_list.pack(fill="both", expand=True) # Fills the entire log card container
         
-        # 3. Create the mouse scroll handler function
+
         def _on_mouse_wheel(event):
             # Windows sends mouse delta movements in factors of 120
             # Dividing by -120 converts it into a uniform single line scroll step
             self.log_list.yview_scroll(int(-1 * (event.delta / 120)), "units")
             
-        # 4. Bind the event directly to the widget so it captures mouse wheel tracking splits
         self.log_list.bind("<MouseWheel>", _on_mouse_wheel)
         
-        # ---  SCROLLBAR IMPLEMENTATION ---
-        # # Create a frame to hold both the listbox and scrollbar together side-by-side
-        # list_container = tk.Frame(log_frame, bg=COLORS["card"])
-        # list_container.pack(fill="both", expand=True, pady=(6, 0))
-        
-        # scrollbar = tk.Scrollbar(list_container, 
-        #                         bg=COLORS["card"], 
-        #                         troughcolor=COLORS["bg"], 
-        #                         activebackground=COLORS["primary"],
-        #                         bd=0, 
-        #                         highlightthickness=0)
-        # scrollbar.pack(side="right", fill="y")
-        
-        # self.log_list = tk.Listbox(list_container, yscrollcommand=scrollbar.set)
-        # self._style_listbox(self.log_list)
-        # self.log_list.pack(side="left", fill="both", expand=True)
-        
-        # # Tie the scrollbar directly to the listbox movement
-        # scrollbar.config(command=self.log_list.yview)
-        # ------------------------------------
         self._start_reader_threads()
         self._log(f"Signed in. Listening on: {', '.join(self.db.serial_ports)}")
         self.after(100, self._poll_queue)
@@ -678,7 +656,7 @@ class ScannerApp(tk.Tk):
         
         message = (
             "Center Scanner Companion\n"
-            "Version 1.0.0\n\n"
+            f"Version {CURRENT_VERSION}\n\n"
             "An independent background utility designed to streamline center check-in & check-out operations.\n\n"
             "Legal Disclaimer:\n"
             "This software is an entirely independent, third-party utility tool. "
@@ -756,6 +734,85 @@ class ScannerApp(tk.Tk):
                 messagebox.showinfo("Success", f"Scan log successfully exported to:\n{file_path}")
             except Exception as e:
                 messagebox.showerror("Export Error", f"Could not save file: {e}")
+
+    def check_for_updates(self, silent=True):
+        """Fetches the remote manifest file to see if a newer iteration exists.
+        If silent=True, it runs quietly on startup. If False, it alerts the user manually."""
+        
+        try:
+            # Query the web manifest file asynchronously
+            response = requests.get(MANIFEST_URL, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                remote_version = data.get("version", "1.0.0")
+                download_url = data.get("url")
+                
+                # Check if the fetched server build string is higher than our native constant
+                if remote_version > CURRENT_VERSION:
+                    # Prompt the user with a standard confirmation popup dialog box
+                    msg = f"A new software update (v{remote_version}) is available!\n\nWhat's New:\n{data.get('changelog')}\n\nWould you like to download and apply the update now?"
+                    if messagebox.askyesno("Update Available", msg):
+                        self._apply_background_update(download_url)
+                else:
+                    if not silent:
+                        messagebox.showinfo("Up to Date", "You are running the latest version of Scanner Companion.")
+        except Exception as e:
+            if not silent:
+                messagebox.showerror("Update Error", f"Failed to connect to the update server:\n{e}")
+
+    def _apply_background_update(self, download_url):
+        """Downloads the new binary executable into a temp folder and triggers the file-swap batch handler."""
+        import requests
+        import subprocess
+        import sys
+        import os
+        from tkinter import messagebox
+        
+        try:
+            # Update footer display state visually so the user doesn't close it mid-stream
+            self.status_label.config(text="📥 Downloading software update... Please wait.", fg=COLORS["warning"])
+            self.update()
+
+            r = requests.get(download_url, stream=True, timeout=30)
+            if r.status_code == 200:
+                # Path configurations
+                exe_path = os.path.abspath(sys.argv[0])          # Path to current running .exe
+                current_dir = os.path.dirname(exe_path)
+                temp_new_exe = os.path.join(current_dir, "new_version.tmp")
+                bat_script_path = os.path.join(current_dir, "update_process.bat")
+                
+                with open(temp_new_exe, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        
+                # Create the automated Windows Batch background loop to overwrite the locked exe file
+                # The loop tries to delete the old application until it closes, then renames the temp file
+                bat_content = f"""
+                @echo off
+                :loop
+                taskkill /F /PID {os.getpid()} >nul 2>&1
+                del "{exe_path}" >nul 2>&1
+                if exist "{exe_path}" (
+                    timeout /t 1 /nobreak >nul
+                    goto loop
+                )
+                move "{temp_new_exe}" "{exe_path}" >nul 2>&1
+                start "" "{exe_path}"
+                del "%~f0" & exit
+                """
+                
+                with open(bat_script_path, "w") as bat_file:
+                    bat_file.write(bat_content)
+                    
+                # Launch the script completely decoupled from the main process pipeline, then kill the app
+                subprocess.Popen([bat_script_path], shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
+                self.destroy()
+                sys.exit()
+                
+        except Exception as e:
+            messagebox.showerror("Update Interrupted", f"Could not complete installation:\n{e}")
+            self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
+
 
 
     def _clear_window(self):
