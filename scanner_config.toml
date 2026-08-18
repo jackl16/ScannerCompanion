@@ -1,0 +1,14 @@
+[supabase]
+url = "https://gtyvdvztxyoanlbmftej.supabase.co"
+key = "sb_publishable_a1W1qy9NHAVdut7jBJ0oDw_2YjvA8oQ"
+
+[center]
+auth_email = ""
+auth_password = ""
+
+[scanner]
+baud_rate = 9600
+debounce_seconds = 60
+ports = [
+    "COM4",
+]

@@ -1,4 +1,3 @@
-# ScannerCompanion
 ### Center Scanner Companion
 
 ## User & Setup Guide
