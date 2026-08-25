@@ -13,7 +13,7 @@ Run:
 import requests
 from tkinter import messagebox
 
-CURRENT_VERSION = "1.0.0"
+CURRENT_VERSION = "1.0.1"
 MANIFEST_URL = "https://raw.githubusercontent.com/jackl16/ScannerCompanion/refs/heads/main/version.json"
 
 import queue
