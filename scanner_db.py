@@ -17,6 +17,9 @@ import tomli_w  # pip install tomli_w  (writing TOML isn't in the stdlib)
 from datetime import datetime, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
+import re
+
+
 
 from supabase import create_client, Client
 
@@ -33,6 +36,7 @@ LOCAL_TZ = ZoneInfo("America/Edmonton")  # match the Streamlit app's timezone
 
 TOKEN_REFRESH_INTERVAL_SECONDS = 30 * 60  # refresh well before Supabase's ~1hr token expiry
 
+STAFF_CODE_PATTERN = re.compile(r"^S\d{5}$")
 
 class AuthError(Exception):
     """Raised when the configured scanner account can't sign in."""
@@ -267,22 +271,82 @@ class ScannerDB:
                 "date": today,
             }).execute()
 
+    # --- staff ---
+
+    def get_staff(self) -> list:
+        now = time.monotonic()
+        if not hasattr(self, "_staff_cache_time") or now - self._staff_cache_time > self._cache_ttl_seconds:
+            resp = (
+                self.client.table("staff")
+                .select("*")
+                .eq("center_id", self.center_id)
+                .eq("status", "active")
+                .execute()
+            )
+            self._staff_cache = resp.data
+            self._staff_cache_time = now
+        return self._staff_cache
+
+    def find_staff(self, staff_code: str) -> dict | None:
+        for s in self.get_staff():
+            if str(s.get("staff_code", "")).strip() == staff_code:
+                return s
+        return None
+
+    # --- staff attendance  ---
+
+    def get_today_staff_attendance(self, staff_id: str) -> dict | None:
+        today = self.local_date().isoformat()
+        resp = (
+            self.client.table("staff_time_logs")
+            .select("*")
+            .eq("center_id", self.center_id)
+            .eq("staff_id", staff_id)
+            .eq("date", today)
+            .execute()
+        )
+        return resp.data[0] if resp.data else None
+
+    def set_staff_attendance(self, staff_id: str, **fields):
+        today = self.local_date().isoformat()
+        existing = self.get_today_staff_attendance(staff_id)
+
+        if existing:
+            self.client.table("staff_time_logs").update(fields).eq("log_id", existing["log_id"]).execute()
+        else:
+            self.client.table("staff_time_logs").insert({
+                **fields,
+                "center_id": self.center_id,
+                "staff_id": staff_id,
+                "date": today,
+            }).execute()
+
+
+
     def process_scan(self, raw_scan: str) -> tuple[str, str]:
         """
-        Looks up the scanned ID, toggles check-in/check-out, and returns
-        (status, message) where status is one of:
+        Looks up the scanned code, toggles check-in/check-out, and returns
+        (status, message). Routes to staff or student handling based on
+        the scan's format: 'S' + 5 digits is a staff code, plain digits
+        is a student ID. Status is one of:
         'checked_in', 'checked_out', 'already_done', 'not_found', 'invalid'
         """
-        clean_id = raw_scan.strip()
-        if not clean_id.isdigit():
-            return "invalid", f"Ignored non-numeric scan: '{raw_scan}'"
+        clean_scan = raw_scan.strip()
 
         now = time.monotonic()
-        if clean_id == self._last_scan_id and (now - self._last_scan_time) < self.debounce_seconds:
-            return "debounced", f"Ignored repeat scan of {clean_id} (within {self.debounce_seconds}s)"
-        self._last_scan_id = clean_id
+        if clean_scan == self._last_scan_id and (now - self._last_scan_time) < self.debounce_seconds:
+            return "debounced", f"Ignored repeat scan of {clean_scan} (within {self.debounce_seconds}s)"
+        self._last_scan_id = clean_scan
         self._last_scan_time = now
 
+        if STAFF_CODE_PATTERN.match(clean_scan):
+            return self._process_staff_scan(clean_scan)
+        elif clean_scan.isdigit():
+            return self._process_student_scan(clean_scan)
+        else:
+            return "invalid", f"Ignored unrecognized scan format: '{raw_scan}'"
+
+    def _process_student_scan(self, clean_id: str) -> tuple[str, str]:
         student = self.find_student(clean_id)
         if student is None:
             return "not_found", f"Scanned ID {clean_id} not found in student database."
@@ -298,5 +362,24 @@ class ScannerDB:
         elif current_status == "In":
             self.set_attendance(clean_id, attendance="Out", time_out=now_str)
             return "checked_out", f"👋 Checked OUT: {display_name}"
+        else:
+            return "already_done", f"ℹ️ {display_name} already logged as '{current_status}'"
+
+    def _process_staff_scan(self, staff_code: str) -> tuple[str, str]:
+        staff = self.find_staff(staff_code)
+        if staff is None:
+            return "not_found", f"Scanned staff code {staff_code} not found."
+
+        display_name = staff.get("first_name") or staff_code
+        existing = self.get_today_staff_attendance(staff["staff_id"])
+        current_status = existing["attendance"] if existing else "Not Clocked In"
+        now_str = self.local_now().strftime("%H:%M:%S")
+
+        if current_status == "Not Clocked In":
+            self.set_staff_attendance(staff["staff_id"], attendance="In", time_in=now_str)
+            return "checked_in", f"👔 Staff Clocked IN: {display_name}"
+        elif current_status == "In":
+            self.set_staff_attendance(staff["staff_id"], attendance="Out", time_out=now_str)
+            return "checked_out", f"👋 Staff Clocked OUT: {display_name}"
         else:
             return "already_done", f"ℹ️ {display_name} already logged as '{current_status}'"

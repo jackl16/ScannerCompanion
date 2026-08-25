@@ -19,8 +19,15 @@ MANIFEST_URL = "https://raw.githubusercontent.com/jackl16/ScannerCompanion/refs/
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox,filedialog
 from datetime import datetime
+import os           
+import requests
+import subprocess
+import sys
+
+
+import winsound
 
 import serial
 import serial.tools.list_ports
@@ -111,6 +118,8 @@ class ScannerApp(tk.Tk):
         self.geometry("560x560")
         self.resizable(False, False)
         self.configure(bg=COLORS["bg"])
+
+        self.sound_enabled = tk.BooleanVar(value=False) 
 
         self._setup_style()
 
@@ -226,6 +235,11 @@ class ScannerApp(tk.Tk):
 
         settings_menu = self._make_menu()
         settings_menu.add_command(label="🔎 Detect Scanner", command=self._show_scanner_setup_screen)
+        settings_menu.add_separator()
+        settings_menu.add_checkbutton(
+            label="Enable Audio Feedback", 
+            variable=self.sound_enabled
+        )        
         menu_bar.add_cascade(label="Settings", menu=settings_menu)
 
         # Status -- one entry per port, updated live as scans/errors come in.
@@ -634,6 +648,13 @@ class ScannerApp(tk.Tk):
             else:
                 status, message = "error", f"⚠️ Error processing scan: {e}"
 
+        error_states = {"not_found", "invalid", "error"}
+
+        if status in error_states:
+            self._play_feedback_sound(is_success=False) # Play warning buzz
+        elif status != "debounced":
+            self._play_feedback_sound(is_success=True)  # Play success chirp
+
         colors = {
             "checked_in": COLORS["success"],
             "checked_out": COLORS["primary_dark"], # A slightly darker blue for contrast text readability
@@ -668,9 +689,8 @@ class ScannerApp(tk.Tk):
 
     def _open_setup_guide(self):
         """Automatically launches the documentation file or a web link in the user's browser."""
-        import os
-        import webbrowser
-        from tkinter import messagebox
+
+
 
         if os.path.exists("README.txt"):
             os.startfile("README.txt")
@@ -680,7 +700,6 @@ class ScannerApp(tk.Tk):
 
     def _show_troubleshooting_wizard(self):
         """Launches a structural checklist pop-up to help users fix hardware connection stalls."""
-        from tkinter import messagebox
         
         tips = (
             "**Please note that hardware scanners MUST have and be in 'COM' mode**\n\n"
@@ -706,7 +725,7 @@ class ScannerApp(tk.Tk):
 
     def _export_scan_log(self):
         """Saves the current live scan log items into a clean text file."""
-        from tkinter import filedialog, messagebox
+
         
         # Check if there is actually anything to export
         if not hasattr(self, 'log_list') or self.log_list.size() == 0:
@@ -762,11 +781,7 @@ class ScannerApp(tk.Tk):
 
     def _apply_background_update(self, download_url):
         """Downloads the new binary executable into a temp folder and triggers the file-swap batch handler."""
-        import requests
-        import subprocess
-        import sys
-        import os
-        from tkinter import messagebox
+
         
         try:
             # Update footer display state visually so the user doesn't close it mid-stream
@@ -813,7 +828,26 @@ class ScannerApp(tk.Tk):
             messagebox.showerror("Update Interrupted", f"Could not complete installation:\n{e}")
             self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
 
-
+    def _play_feedback_sound(self, is_success=True):
+        """Plays a native Windows beep pattern if audio feedback is enabled."""
+        if not self.sound_enabled.get():
+            return  # Exit instantly if the user toggled sounds off
+            
+        
+        def run_sound():
+            try:
+                if is_success:
+                    # High pitched, quick chirp (Frequency 1000Hz, Duration 150ms)
+                    winsound.Beep(1000, 150)
+                else:
+                    # Lower pitched, longer warning buzzer sound (Frequency 400Hz, Duration 400ms)
+                    winsound.Beep(400, 400)
+            except Exception:
+                pass # Fail silently if system audio drivers are locked down
+                
+        # Spawn the audio execution in a micro-thread branch so the main UI loop 
+        # doesn't freeze for a split second while the speaker card activates
+        threading.Thread(target=run_sound, daemon=True).start()
 
     def _clear_window(self):
         for widget in self.winfo_children():
