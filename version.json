@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
-  "url": "https://github.com/jackl16/ScannerCompanion/releases/download/v1.0.0/ScannerCompanion.exe",
-  "changelog": "Base app"
+  "version": "1.0.1",
+  "url": "https://github.com/jackl16/ScannerCompanion/releases/download/v1.0.1/ScannerCompanion.exe",
+  "changelog": "Staff scanning, sound feedback"
 }
