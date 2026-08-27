@@ -237,29 +237,30 @@ class ScannerDB:
             self._students_cache_time = now
         return self._students_cache
 
-    def find_student(self, student_id: str) -> dict | None:
+    def find_student(self, code: str) -> dict | None:
         for s in self.get_students():
-            if str(s.get("student_id", "")).strip() == student_id:
+            if str(s.get("barcode_code", "")).strip() == code:
                 return s
         return None
 
     # --- attendance ---
 
-    def get_today_attendance(self, student_id: str) -> dict | None:
+    def get_today_attendance(self, s_id: int) -> dict | None:
         today = self.local_date().isoformat()
         resp = (
             self.client.table("attendance_logs")
             .select("*")
             .eq("center_id", self.center_id)
-            .eq("student_id", student_id)
+            .eq("s_id", s_id)
             .eq("date", today)
             .execute()
         )
         return resp.data[0] if resp.data else None
 
-    def set_attendance(self, student_id: str, **fields):
+
+    def set_attendance(self, s_id: int, **fields):
         today = self.local_date().isoformat()
-        existing = self.get_today_attendance(student_id)
+        existing = self.get_today_attendance(s_id)
 
         if existing:
             self.client.table("attendance_logs").update(fields).eq("log_id", existing["log_id"]).execute()
@@ -267,7 +268,7 @@ class ScannerDB:
             self.client.table("attendance_logs").insert({
                 **fields,
                 "center_id": self.center_id,
-                "student_id": student_id,
+                "s_id": s_id,
                 "date": today,
             }).execute()
 
@@ -346,21 +347,22 @@ class ScannerDB:
         else:
             return "invalid", f"Ignored unrecognized scan format: '{raw_scan}'"
 
-    def _process_student_scan(self, clean_id: str) -> tuple[str, str]:
-        student = self.find_student(clean_id)
+    def _process_student_scan(self, clean_code: str) -> tuple[str, str]:
+        student = self.find_student(clean_code)
         if student is None:
-            return "not_found", f"Scanned ID {clean_id} not found in student database."
+            return "not_found", f"Scanned code {clean_code} not found in student database."
 
-        display_name = student.get("first_name") or clean_id
-        existing = self.get_today_attendance(clean_id)
+        s_id = student["s_id"]
+        display_name = student.get("first_name") or clean_code
+        existing = self.get_today_attendance(s_id)
         current_status = existing["attendance"] if existing else "No Show"
         now_str = self.local_now().strftime("%H:%M:%S")
 
         if current_status in ("No Show", ""):
-            self.set_attendance(clean_id, attendance="In", time_in=now_str)
+            self.set_attendance(s_id, attendance="In", time_in=now_str)
             return "checked_in", f"✅ Checked IN: {display_name}"
         elif current_status == "In":
-            self.set_attendance(clean_id, attendance="Out", time_out=now_str)
+            self.set_attendance(s_id, attendance="Out", time_out=now_str)
             return "checked_out", f"👋 Checked OUT: {display_name}"
         else:
             return "already_done", f"ℹ️ {display_name} already logged as '{current_status}'"

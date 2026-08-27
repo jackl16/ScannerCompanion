@@ -423,6 +423,9 @@ class ScannerApp(tk.Tk):
             ttk.Button(
                 button_row, text="Cancel", style="Secondary.TButton", command=self._cancel_detection
             ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            button_row, text="Logout", style="Secondary.TButton", command=self._logout
+        ).pack(side="right")
 
         self.probe_log_list = tk.Listbox(frame, height=8)
         self._style_listbox(self.probe_log_list)
@@ -785,8 +788,9 @@ class ScannerApp(tk.Tk):
         
         try:
             # Update footer display state visually so the user doesn't close it mid-stream
-            self.status_label.config(text="📥 Downloading software update... Please wait.", fg=COLORS["warning"])
-            self.update()
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="📥 Downloading software update... Please wait.", fg=COLORS["warning"])
+                self.update()
 
             r = requests.get(download_url, stream=True, timeout=30)
             if r.status_code == 200:
@@ -804,8 +808,8 @@ class ScannerApp(tk.Tk):
                 # The loop tries to delete the old application until it closes, then renames the temp file
                 bat_content = f"""
                 @echo off
+                timeout /t 2 /nobreak >nul
                 :loop
-                taskkill /F /PID {os.getpid()} >nul 2>&1
                 del "{exe_path}" >nul 2>&1
                 if exist "{exe_path}" (
                     timeout /t 1 /nobreak >nul
@@ -815,12 +819,14 @@ class ScannerApp(tk.Tk):
                 start "" "{exe_path}"
                 del "%~f0" & exit
                 """
-                
+
                 with open(bat_script_path, "w") as bat_file:
                     bat_file.write(bat_content)
-                    
-                # Launch the script completely decoupled from the main process pipeline, then kill the app
+
                 subprocess.Popen([bat_script_path], shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
+                self.stop_event.set()
+                self.probe_stop_event.set()
+                self.db.stop()
                 self.destroy()
                 sys.exit()
                 
