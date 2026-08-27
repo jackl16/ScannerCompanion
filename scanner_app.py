@@ -25,6 +25,7 @@ import os
 import requests
 import subprocess
 import sys
+from pathlib import Path
 
 
 import winsound
@@ -783,56 +784,80 @@ class ScannerApp(tk.Tk):
                 messagebox.showerror("Update Error", f"Failed to connect to the update server:\n{e}")
 
     def _apply_background_update(self, download_url):
-        """Downloads the new binary executable into a temp folder and triggers the file-swap batch handler."""
-
-        
         try:
-            # Update footer display state visually so the user doesn't close it mid-stream
-            if hasattr(self, 'status_label'):
-                self.status_label.config(text="📥 Downloading software update... Please wait.", fg=COLORS["warning"])
-                self.update()
+            downloads_dir = Path.home() / "Downloads"
+            installer_path = downloads_dir / "ScannerCompanion_Update.exe"
+            old_exe_path = os.path.abspath(sys.argv[0])
 
             r = requests.get(download_url, stream=True, timeout=30)
             if r.status_code == 200:
-                # Path configurations
-                exe_path = os.path.abspath(sys.argv[0])          # Path to current running .exe
-                current_dir = os.path.dirname(exe_path)
-                temp_new_exe = os.path.join(current_dir, "new_version.tmp")
-                bat_script_path = os.path.join(current_dir, "update_process.bat")
-                
-                with open(temp_new_exe, 'wb') as f:
+                with open(installer_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
-                        
-                # Create the automated Windows Batch background loop to overwrite the locked exe file
-                # The loop tries to delete the old application until it closes, then renames the temp file
-                bat_content = f"""
-                @echo off
-                timeout /t 2 /nobreak >nul
-                :loop
-                del "{exe_path}" >nul 2>&1
-                if exist "{exe_path}" (
-                    timeout /t 1 /nobreak >nul
-                    goto loop
+
+                messagebox.showinfo(
+                    "Update Downloaded",
+                    f"The new version was saved to:\n{installer_path}\n\n"
+                    f"To finish updating:\n"
+                    f"1. Close this app\n"
+                    f"2. Delete or rename the old file at:\n   {old_exe_path}\n"
+                    f"3. Move the new file from Downloads to that same location\n"
+                    f"   (keep the same filename so your desktop shortcut still works)"
                 )
-                move "{temp_new_exe}" "{exe_path}" >nul 2>&1
-                start "" "{exe_path}"
-                del "%~f0" & exit
-                """
-
-                with open(bat_script_path, "w") as bat_file:
-                    bat_file.write(bat_content)
-
-                subprocess.Popen([bat_script_path], shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
-                self.stop_event.set()
-                self.probe_stop_event.set()
-                self.db.stop()
-                self.destroy()
-                sys.exit()
-                
+                os.startfile(downloads_dir)
         except Exception as e:
-            messagebox.showerror("Update Interrupted", f"Could not complete installation:\n{e}")
-            self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
+            messagebox.showerror("Update Failed", f"Could not download update:\n{e}")
+    # def _apply_background_update(self, download_url):
+    #     """Downloads the new binary executable into a temp folder and triggers the file-swap batch handler."""
+
+        
+    #     try:
+    #         # Update footer display state visually so the user doesn't close it mid-stream
+    #         if hasattr(self, 'status_label'):
+    #             self.status_label.config(text="📥 Downloading software update... Please wait.", fg=COLORS["warning"])
+    #             self.update()
+
+    #         r = requests.get(download_url, stream=True, timeout=30)
+    #         if r.status_code == 200:
+    #             # Path configurations
+    #             exe_path = os.path.abspath(sys.argv[0])          # Path to current running .exe
+    #             current_dir = os.path.dirname(exe_path)
+    #             temp_new_exe = os.path.join(current_dir, "new_version.tmp")
+    #             bat_script_path = os.path.join(current_dir, "update_process.bat")
+                
+    #             with open(temp_new_exe, 'wb') as f:
+    #                 for chunk in r.iter_content(chunk_size=8192):
+    #                     f.write(chunk)
+                        
+    #             # Create the automated Windows Batch background loop to overwrite the locked exe file
+    #             # The loop tries to delete the old application until it closes, then renames the temp file
+    #             bat_content = f"""
+    #             @echo off
+    #             timeout /t 2 /nobreak >nul
+    #             :loop
+    #             del "{exe_path}" >nul 2>&1
+    #             if exist "{exe_path}" (
+    #                 timeout /t 1 /nobreak >nul
+    #                 goto loop
+    #             )
+    #             move "{temp_new_exe}" "{exe_path}" >nul 2>&1
+    #             start "" "{exe_path}"
+    #             del "%~f0" & exit
+    #             """
+
+    #             with open(bat_script_path, "w") as bat_file:
+    #                 bat_file.write(bat_content)
+
+    #             subprocess.Popen([bat_script_path], shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
+    #             self.stop_event.set()
+    #             self.probe_stop_event.set()
+    #             self.db.stop()
+    #             self.destroy()
+    #             sys.exit()
+                
+    #     except Exception as e:
+    #         messagebox.showerror("Update Interrupted", f"Could not complete installation:\n{e}")
+    #         self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
 
     def _play_feedback_sound(self, is_success=True):
         """Plays a native Windows beep pattern if audio feedback is enabled."""
