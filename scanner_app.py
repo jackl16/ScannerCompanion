@@ -135,8 +135,6 @@ class ScannerApp(tk.Tk):
         self.resizable(False, False)
         self.configure(bg=COLORS["bg"])
 
-        self.sound_enabled = tk.BooleanVar(value=False) 
-
         self._setup_style()
 
 
@@ -146,6 +144,10 @@ class ScannerApp(tk.Tk):
             messagebox.showerror("Missing config", str(e))
             self.destroy()
             return
+
+        # loaded from scanner_config.toml, so the toggle survives restarts
+        # instead of silently resetting to off every launch
+        self.sound_enabled = tk.BooleanVar(value=self.db.sound_enabled)
 
         self.scan_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -254,7 +256,8 @@ class ScannerApp(tk.Tk):
         settings_menu.add_separator()
         settings_menu.add_checkbutton(
             label="Enable Audio Feedback", 
-            variable=self.sound_enabled
+            variable=self.sound_enabled,
+            command=lambda: self.db.save_sound_enabled(self.sound_enabled.get()),
         )        
         menu_bar.add_cascade(label="Settings", menu=settings_menu)
 

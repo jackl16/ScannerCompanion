@@ -116,6 +116,7 @@ class ScannerDB:
         self.serial_ports = scanner_cfg.get("ports", [])
         self.baud_rate = scanner_cfg.get("baud_rate", 9600)
         self.debounce_seconds = scanner_cfg.get("debounce_seconds", 3)
+        self.sound_enabled = scanner_cfg.get("sound_enabled", False)
 
         self._last_scan_id = None
         self._last_scan_time = 0
@@ -271,6 +272,14 @@ class ScannerDB:
         config.setdefault("scanner", {})["ports"] = ports
         save_config(config)
         self.serial_ports = ports  # keep the in-memory copy in sync too
+
+    def save_sound_enabled(self, enabled: bool) -> None:
+        """Persists the Audio Feedback toggle so it survives app restarts
+        instead of silently resetting to off every launch."""
+        config = load_config()
+        config.setdefault("scanner", {})["sound_enabled"] = enabled
+        save_config(config)
+        self.sound_enabled = enabled
 
     # --- local time helpers ---
 
