@@ -1,5 +1,5 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
   "url": "https://github.com/jackl16/ScannerCompanion/releases/download/v1.0.3/ScannerCompanion.exe",
   "changelog": "UI changes, Offline Scans, Delay between scans to prevent doubles"
 }
