@@ -32,11 +32,37 @@ else:
 
 CONFIG_PATH = BASE_DIR / "scanner_config.toml"
 SESSION_FILE = BASE_DIR / "scanner_session.json"  # holds the remember-me refresh token
+PENDING_SCANS_FILE = BASE_DIR / "pending_scans.json"  # offline buffer -- scans that
+                                                        # couldn't reach Supabase yet
 LOCAL_TZ = ZoneInfo("America/Edmonton")  # match the Streamlit app's timezone
 
 TOKEN_REFRESH_INTERVAL_SECONDS = 30 * 60  # refresh well before Supabase's ~1hr token expiry
 
 STAFF_CODE_PATTERN = re.compile(r"^S\d{5}$")
+
+# Substrings that show up in exceptions caused by *connectivity* problems
+# (no internet, DNS hiccup, request timeout, etc.) as opposed to a genuine
+# application error. Used to decide whether a failed scan should be queued
+# for retry rather than surfaced as a hard error, and whether a failed
+# session refresh should be treated as "try again later" instead of
+# "this token is dead, forget it".
+NETWORK_ERROR_MARKERS = (
+    "network", "connection", "timeout", "timed out", "unreachable",
+    "getaddrinfo", "max retries", "temporary failure", "name resolution",
+    "connection reset", "connection aborted",
+)
+
+# Substrings that indicate Supabase itself rejected the refresh token
+# (expired, revoked, already used, malformed) -- these are the *only*
+# cases where it's safe to delete the remembered session file. Anything
+# else (a network blip while refreshing) should NOT delete it, or "remember
+# me" quietly stops working the next time the app is opened with no wifi.
+INVALID_TOKEN_MARKERS = (
+    "invalid_grant", "invalid refresh token", "refresh_token_not_found",
+    "already used", "revoked", "expired", "invalid token", "invalid_token",
+    "session_not_found", "user_not_found",
+)
+
 
 class AuthError(Exception):
     """Raised when the configured scanner account can't sign in."""
@@ -97,6 +123,7 @@ class ScannerDB:
         self.last_auth_error = None
 
         self._stop_event = threading.Event()
+        self._pending_lock = threading.Lock()  # guards pending_scans.json read/write
 
         # No auto sign-in here anymore -- the app calls sign_in(email, password)
         # or try_remembered_login() explicitly after showing/skipping the login screen.
@@ -125,7 +152,16 @@ class ScannerDB:
 
     def try_remembered_login(self) -> bool:
         """Attempts to restore a session from the local remember-me file.
-        Returns True if successful."""
+        Returns True if successful.
+
+        IMPORTANT: only deletes the remembered session file when Supabase
+        has *confirmed* the refresh token is actually dead (expired,
+        revoked, already used). A transient error (no wifi yet on boot, a
+        DNS hiccup, a request timeout) must NOT delete it -- that was the
+        cause of "remember me" appearing to randomly stop working: any
+        exception at all was wiping the file, even ones that had nothing
+        to do with the token itself.
+        """
         if not SESSION_FILE.exists():
             return False
 
@@ -133,16 +169,28 @@ class ScannerDB:
             saved = json.loads(SESSION_FILE.read_text())
             refresh_token = saved["refresh_token"]
         except Exception:
+            # the file itself is corrupt/unreadable -- nothing to restore
             self.forget_remembered_session()
             return False
 
         try:
             auth_resp = self.client.auth.refresh_session(refresh_token)
-        except Exception:
-            self.forget_remembered_session()
+        except Exception as e:
+            if self._is_invalid_token_error(e):
+                self.forget_remembered_session()
+            else:
+                # probably offline or Supabase is briefly unreachable --
+                # leave the remembered session alone and just fall back to
+                # the login screen this launch; it'll work next time
+                self.last_auth_error = (
+                    "Couldn't reach the server to restore your saved login "
+                    "(check your internet connection)."
+                )
             return False
 
         if not auth_resp or not auth_resp.session:
+            # Supabase responded but didn't hand back a session -- treat
+            # this as a genuinely dead token, not a connectivity issue
             self.forget_remembered_session()
             return False
 
@@ -152,6 +200,16 @@ class ScannerDB:
         else:
             self.forget_remembered_session()
         return success
+
+    @staticmethod
+    def _is_invalid_token_error(e: Exception) -> bool:
+        msg = str(e).lower()
+        return any(marker in msg for marker in INVALID_TOKEN_MARKERS)
+
+    @staticmethod
+    def _looks_like_network_error(e: Exception) -> bool:
+        msg = str(e).lower()
+        return any(marker in msg for marker in NETWORK_ERROR_MARKERS)
 
     def remember_session(self, refresh_token: str):
         SESSION_FILE.write_text(json.dumps({"refresh_token": refresh_token}))
@@ -322,7 +380,69 @@ class ScannerDB:
                 "date": today,
             }).execute()
 
+    # --- offline buffer (JSON) -------------------------------------------
+    # If Supabase can't be reached mid-scan, the raw scan gets appended to
+    # pending_scans.json instead of being silently lost. Every subsequent
+    # scan -- and a periodic timer in the app -- tries to drain this queue
+    # in order before/alongside processing new scans.
 
+    def _load_pending(self) -> list:
+        if not PENDING_SCANS_FILE.exists():
+            return []
+        try:
+            return json.loads(PENDING_SCANS_FILE.read_text())
+        except Exception:
+            return []  # corrupt file -- don't crash the app over a queue file
+
+    def _save_pending(self, pending: list) -> None:
+        PENDING_SCANS_FILE.write_text(json.dumps(pending, indent=2))
+
+    def pending_count(self) -> int:
+        with self._pending_lock:
+            return len(self._load_pending())
+
+    def _queue_pending_scan(self, clean_scan: str) -> None:
+        with self._pending_lock:
+            pending = self._load_pending()
+            pending.append({
+                "code": clean_scan,
+                "queued_at": self.local_now().isoformat(),
+            })
+            self._save_pending(pending)
+
+    def flush_pending_scans(self) -> int:
+        """Replays queued offline scans against Supabase, oldest first.
+        Stops at the first one that still fails for network reasons (the
+        rest are almost certainly still offline too -- no point hammering
+        a dead connection) but drops any entry that fails for a *non*
+        network reason (e.g. bad/corrupt data) so the queue can't jam
+        forever on one bad entry. Returns how many were flushed."""
+        with self._pending_lock:
+            pending = self._load_pending()
+            if not pending:
+                return 0
+
+            remaining = list(pending)
+            flushed = 0
+            for entry in pending:
+                code = str(entry.get("code", ""))
+                try:
+                    if STAFF_CODE_PATTERN.match(code):
+                        self._process_staff_scan(code)
+                    elif code.isdigit():
+                        self._process_student_scan(code)
+                    # anything else was already invalid at queue time and
+                    # would've been rejected before ever reaching the
+                    # queue -- but drop it defensively just in case
+                    remaining.pop(0)
+                    flushed += 1
+                except Exception as e:
+                    if self._looks_like_network_error(e):
+                        break  # still offline -- leave this and the rest queued
+                    remaining.pop(0)  # a real (non-network) failure -- don't retry forever
+
+            self._save_pending(remaining)
+            return flushed
 
     def process_scan(self, raw_scan: str) -> tuple[str, str]:
         """
@@ -330,7 +450,8 @@ class ScannerDB:
         (status, message). Routes to staff or student handling based on
         the scan's format: 'S' + 5 digits is a staff code, plain digits
         is a student ID. Status is one of:
-        'checked_in', 'checked_out', 'already_done', 'not_found', 'invalid'
+        'checked_in', 'checked_out', 'already_done', 'not_found', 'invalid',
+        'queued' (Supabase unreachable -- scan saved locally for retry)
         """
         clean_scan = raw_scan.strip()
 
@@ -340,12 +461,23 @@ class ScannerDB:
         self._last_scan_id = clean_scan
         self._last_scan_time = now
 
-        if STAFF_CODE_PATTERN.match(clean_scan):
-            return self._process_staff_scan(clean_scan)
-        elif clean_scan.isdigit():
-            return self._process_student_scan(clean_scan)
-        else:
+        if not (STAFF_CODE_PATTERN.match(clean_scan) or clean_scan.isdigit()):
             return "invalid", f"Ignored unrecognized scan format: '{raw_scan}'"
+
+        # try to clear any backlog first so scans replay in the order they
+        # actually happened, then process this scan the normal way
+        self.flush_pending_scans()
+
+        try:
+            if STAFF_CODE_PATTERN.match(clean_scan):
+                return self._process_staff_scan(clean_scan)
+            else:
+                return self._process_student_scan(clean_scan)
+        except Exception as e:
+            if self._looks_like_network_error(e):
+                self._queue_pending_scan(clean_scan)
+                return "queued", f"⏳ Offline -- saved scan '{clean_scan}' to retry automatically"
+            raise  # a genuine bug/data issue -- let the caller's generic handler surface it
 
     def _process_student_scan(self, clean_code: str) -> tuple[str, str]:
         student = self.find_student(clean_code)

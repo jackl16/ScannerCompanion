@@ -13,13 +13,15 @@ Run:
 import requests
 from tkinter import messagebox
 
-CURRENT_VERSION = "1.0.2"
+CURRENT_VERSION = "1.0.3"
 MANIFEST_URL = "https://raw.githubusercontent.com/jackl16/ScannerCompanion/refs/heads/main/version.json"
 
+import csv
 import queue
 import threading
+import time
 import tkinter as tk
-from tkinter import ttk, messagebox,filedialog
+from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 import os           
 import requests
@@ -37,8 +39,12 @@ from scanner_db import ScannerDB
 
 FONT = "Segoe UI"
 
-# Clean blue & white palette -- kept as one dict so the whole look can be
-# retuned from a single place later without hunting through every screen.
+# Minimum time between two accepted reads on the *same physical port*.
+# Cheap USB barcode scanners occasionally double-fire on a single swipe
+# (a bit of movement, a bounce on the trigger, etc.), which reads as two
+# separate lines a few milliseconds apart. 
+MIN_SCAN_INTERVAL_SECONDS = 1.0
+
 COLORS = {
     "bg": "#121214",          # app background (soft slate)
     "card": "#1a1a1e",         # panels/cards
@@ -51,7 +57,8 @@ COLORS = {
     "on_primary": "#FFFFFF",
     "success": "#10b981",  
     "error": "#ef4444",    
-    "warning": "#f59e0b" 
+    "warning": "#f59e0b",
+    "log_text": "#39ff14",     # matrix-green scan log text
 }
 
 
@@ -65,6 +72,7 @@ class SerialReaderThread(threading.Thread):
         self.baud_rate = baud_rate
         self.output_queue = output_queue
         self.stop_event = stop_event
+        self._last_read_time = 0.0  # monotonic clock -- for the per-port rate limit
     
 
     def run(self):
@@ -77,6 +85,13 @@ class SerialReaderThread(threading.Thread):
                         if line:
                             decoded = line.decode(errors="ignore").strip()
                             if decoded:
+                                now = time.monotonic()
+                                if now - self._last_read_time < MIN_SCAN_INTERVAL_SECONDS:
+                                    # almost certainly a physical double-read on this
+                                    # exact scanner (jitter/bounce), not a second,
+                                    # genuine scan -- silently drop it
+                                    continue
+                                self._last_read_time = now
                                 self.output_queue.put(("scan", self.port, decoded))
             except serial.SerialException as e:
                 self.output_queue.put(("status", self.port, f"error: {e}"))
@@ -276,10 +291,8 @@ class ScannerApp(tk.Tk):
         self.config(menu=tk.Menu(self))
 
     def _style_listbox(self, listbox: tk.Listbox):
-        """tk.Listbox isn't a ttk widget, so it needs its colors set
-        directly rather than through the style system above."""
         listbox.configure(
-            bg=COLORS["card"], fg=COLORS["text"],
+            bg=COLORS["card"], fg=COLORS["log_text"],
             selectbackground="#0056b3", selectforeground=COLORS["on_primary"], # Fixed selection color here
             highlightthickness=0,bd=0,
             relief="flat", borderwidth=0, font=("Consolas", 10),
@@ -354,6 +367,8 @@ class ScannerApp(tk.Tk):
 
         pw_entry.bind("<Return>", try_login)
         ttk.Button(card, text="Login", command=try_login).pack(pady=(8, 0), fill="x")
+
+        ttk.Label(outer, text=f"Scanner Companion v{CURRENT_VERSION}", style="Muted.TLabel").pack(pady=(12, 0))
 
 
     # --- SCANNER DETECTION / SETUP SCREEN --------------------------------
@@ -535,6 +550,16 @@ class ScannerApp(tk.Tk):
         # Dynamic action and feedback message label
         self.status_label = tk.Label(self.status_bar, text="Waiting for scan...", font=(FONT, 10), bg=COLORS["card"], fg=COLORS["text_muted"])
         self.status_label.pack(side=tk.LEFT, padx=4, pady=4)
+
+        # Offline-queue indicator -- blank when nothing is queued
+        self.pending_label = tk.Label(self.status_bar, text="", font=(FONT, 9, "bold"), bg=COLORS["card"])
+        self.pending_label.pack(side=tk.LEFT, padx=(12, 4), pady=4)
+
+        # Version tag, tucked in the corner
+        tk.Label(
+            self.status_bar, text=f"v{CURRENT_VERSION}", font=(FONT, 8),
+            bg=COLORS["card"], fg=COLORS["text_muted"],
+        ).pack(side=tk.RIGHT, padx=(2, 10), pady=4)
         # ---------------------------------------
 
         log_frame = ttk.Frame(self, padding=20)
@@ -559,6 +584,8 @@ class ScannerApp(tk.Tk):
         self._start_reader_threads()
         self._log(f"Signed in. Listening on: {', '.join(self.db.serial_ports)}")
         self.after(100, self._poll_queue)
+        self._update_pending_label()
+        self.after(20000, self._periodic_flush)
 
 
     def _start_reader_threads(self):
@@ -593,6 +620,28 @@ class ScannerApp(tk.Tk):
             pass
         finally:
             self.after(100, self._poll_queue)
+
+    def _periodic_flush(self):
+        """Every 20s, try to drain the offline scan queue -- catches the
+        case where connectivity comes back but nobody scans anything for
+        a while, so queued check-ins/outs don't just sit there untouched."""
+        try:
+            flushed = self.db.flush_pending_scans()
+            if flushed:
+                self._log(f"✅ Synced {flushed} queued scan(s) that were waiting on a connection.")
+        except Exception:
+            pass  # still offline, or a transient issue -- just try again next cycle
+        self._update_pending_label()
+        self.after(20000, self._periodic_flush)
+
+    def _update_pending_label(self):
+        if not hasattr(self, "pending_label"):
+            return
+        count = self.db.pending_count()
+        if count:
+            self.pending_label.config(text=f"⏳ {count} queued (offline)", fg=COLORS["warning"])
+        else:
+            self.pending_label.config(text="", fg=COLORS["text_muted"])
 
     def _update_port_status(self, port: str, status: str):
         self.port_statuses[port] = status
@@ -653,10 +702,11 @@ class ScannerApp(tk.Tk):
                 status, message = "error", f"⚠️ Error processing scan: {e}"
 
         error_states = {"not_found", "invalid", "error"}
+        neutral_states = {"debounced", "queued"}  # no success chirp -- nothing was confirmed saved yet
 
         if status in error_states:
             self._play_feedback_sound(is_success=False) # Play warning buzz
-        elif status != "debounced":
+        elif status not in neutral_states:
             self._play_feedback_sound(is_success=True)  # Play success chirp
 
         colors = {
@@ -667,12 +717,15 @@ class ScannerApp(tk.Tk):
             "invalid": COLORS["warning"],
             "debounced": COLORS["text_muted"],
             "error": COLORS["error"],
+            "queued": COLORS["warning"],
         }
         # Change foreground to fg here
         self.status_label.config(text=message, fg=colors.get(status, COLORS["text"]))
 
         if status != "debounced":
             self._log(message)
+
+        self._update_pending_label()
 
     def _show_about_popup(self):
         """Displays a clean informational dialog box with version details 
@@ -728,7 +781,8 @@ class ScannerApp(tk.Tk):
         self.log_list.see(0)
 
     def _export_scan_log(self):
-        """Saves the current live scan log items into a clean text file."""
+        """Saves the current live scan log items into a CSV or plain text
+        file, based on the extension the user picks in the save dialog."""
 
         
         # Check if there is actually anything to export
@@ -738,25 +792,34 @@ class ScannerApp(tk.Tk):
             
         # Open a standard Windows "Save As" popup window
         file_path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("Text Files", "*.txt"), ("All Files", "*.*")],
             title="Export Scan Log",
-            initialfile=f"scan_log_{datetime.now().strftime('%Y-%m-%d')}.txt"
+            initialfile=f"scan_log_{datetime.now().strftime('%Y-%m-%d')}.csv"
         )
         
-        # Write the listbox contents to the selected file
-        if file_path:
-            try:
+        if not file_path:
+            return
+
+        log_items = self.log_list.get(0, tk.END)  # oldest-last, since new entries insert at 0
+        try:
+            if file_path.lower().endswith(".csv"):
+                with open(file_path, "w", newline="", encoding="utf-8") as file:
+                    writer = csv.writer(file)
+                    writer.writerow(["Timestamp", "Message"])
+                    for item in log_items:
+                        # entries are formatted as "[HH:MM:SS AM] message"
+                        timestamp, _, message = item.strip().partition("] ")
+                        writer.writerow([timestamp.lstrip("["), message])
+            else:
                 with open(file_path, "w", encoding="utf-8") as file:
-                    # Get all items from the listbox (from index 0 to the very end)
-                    log_items = self.log_list.get(0, tk.END)
                     for item in log_items:
                         # Strip out our internal spacing padding when writing to raw file
                         file.write(item.strip() + "\n")
-                        
-                messagebox.showinfo("Success", f"Scan log successfully exported to:\n{file_path}")
-            except Exception as e:
-                messagebox.showerror("Export Error", f"Could not save file: {e}")
+
+            messagebox.showinfo("Success", f"Scan log successfully exported to:\n{file_path}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Could not save file: {e}")
 
     def check_for_updates(self, silent=True):
         """Fetches the remote manifest file to see if a newer iteration exists.
@@ -783,81 +846,81 @@ class ScannerApp(tk.Tk):
             if not silent:
                 messagebox.showerror("Update Error", f"Failed to connect to the update server:\n{e}")
 
+    #def _apply_background_update(self, download_url):
+        # try:
+        #     downloads_dir = Path.home() / "Downloads"
+        #     installer_path = downloads_dir / "ScannerCompanion_Update.exe"
+        #     old_exe_path = os.path.abspath(sys.argv[0])
+
+        #     r = requests.get(download_url, stream=True, timeout=30)
+        #     if r.status_code == 200:
+        #         with open(installer_path, 'wb') as f:
+        #             for chunk in r.iter_content(chunk_size=8192):
+        #                 f.write(chunk)
+
+        #         messagebox.showinfo(
+        #             "Update Downloaded",
+        #             f"The new version was saved to:\n{installer_path}\n\n"
+        #             f"To finish updating:\n"
+        #             f"1. Close this app\n"
+        #             f"2. Delete or rename the old file at:\n   {old_exe_path}\n"
+        #             f"3. Move the new file from Downloads to that same location\n"
+        #             f"   (keep the same filename so your desktop shortcut still works)"
+        #         )
+        #         os.startfile(downloads_dir)
+        # except Exception as e:
+        #     messagebox.showerror("Update Failed", f"Could not download update:\n{e}")
     def _apply_background_update(self, download_url):
+        """Downloads the new binary executable into a temp folder and triggers the file-swap batch handler."""
+
+        
         try:
-            downloads_dir = Path.home() / "Downloads"
-            installer_path = downloads_dir / "ScannerCompanion_Update.exe"
-            old_exe_path = os.path.abspath(sys.argv[0])
+            # Update footer display state visually so the user doesn't close it mid-stream
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="📥 Downloading software update... Please wait.", fg=COLORS["warning"])
+                self.update()
 
             r = requests.get(download_url, stream=True, timeout=30)
             if r.status_code == 200:
-                with open(installer_path, 'wb') as f:
+                # Path configurations
+                exe_path = os.path.abspath(sys.argv[0])          # Path to current running .exe
+                current_dir = os.path.dirname(exe_path)
+                temp_new_exe = os.path.join(current_dir, "new_version.tmp")
+                bat_script_path = os.path.join(current_dir, "update_process.bat")
+                
+                with open(temp_new_exe, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
-
-                messagebox.showinfo(
-                    "Update Downloaded",
-                    f"The new version was saved to:\n{installer_path}\n\n"
-                    f"To finish updating:\n"
-                    f"1. Close this app\n"
-                    f"2. Delete or rename the old file at:\n   {old_exe_path}\n"
-                    f"3. Move the new file from Downloads to that same location\n"
-                    f"   (keep the same filename so your desktop shortcut still works)"
-                )
-                os.startfile(downloads_dir)
-        except Exception as e:
-            messagebox.showerror("Update Failed", f"Could not download update:\n{e}")
-    # def _apply_background_update(self, download_url):
-    #     """Downloads the new binary executable into a temp folder and triggers the file-swap batch handler."""
-
-        
-    #     try:
-    #         # Update footer display state visually so the user doesn't close it mid-stream
-    #         if hasattr(self, 'status_label'):
-    #             self.status_label.config(text="📥 Downloading software update... Please wait.", fg=COLORS["warning"])
-    #             self.update()
-
-    #         r = requests.get(download_url, stream=True, timeout=30)
-    #         if r.status_code == 200:
-    #             # Path configurations
-    #             exe_path = os.path.abspath(sys.argv[0])          # Path to current running .exe
-    #             current_dir = os.path.dirname(exe_path)
-    #             temp_new_exe = os.path.join(current_dir, "new_version.tmp")
-    #             bat_script_path = os.path.join(current_dir, "update_process.bat")
-                
-    #             with open(temp_new_exe, 'wb') as f:
-    #                 for chunk in r.iter_content(chunk_size=8192):
-    #                     f.write(chunk)
                         
-    #             # Create the automated Windows Batch background loop to overwrite the locked exe file
-    #             # The loop tries to delete the old application until it closes, then renames the temp file
-    #             bat_content = f"""
-    #             @echo off
-    #             timeout /t 2 /nobreak >nul
-    #             :loop
-    #             del "{exe_path}" >nul 2>&1
-    #             if exist "{exe_path}" (
-    #                 timeout /t 1 /nobreak >nul
-    #                 goto loop
-    #             )
-    #             move "{temp_new_exe}" "{exe_path}" >nul 2>&1
-    #             start "" "{exe_path}"
-    #             del "%~f0" & exit
-    #             """
+                # Create the automated Windows Batch background loop to overwrite the locked exe file
+                # The loop tries to delete the old application until it closes, then renames the temp file
+                bat_content = f"""
+                @echo off
+                timeout /t 2 /nobreak >nul
+                :loop
+                del "{exe_path}" >nul 2>&1
+                if exist "{exe_path}" (
+                    timeout /t 1 /nobreak >nul
+                    goto loop
+                )
+                move "{temp_new_exe}" "{exe_path}" >nul 2>&1
+                start "" "{exe_path}"
+                del "%~f0" & exit
+                """
 
-    #             with open(bat_script_path, "w") as bat_file:
-    #                 bat_file.write(bat_content)
+                with open(bat_script_path, "w") as bat_file:
+                    bat_file.write(bat_content)
 
-    #             subprocess.Popen([bat_script_path], shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
-    #             self.stop_event.set()
-    #             self.probe_stop_event.set()
-    #             self.db.stop()
-    #             self.destroy()
-    #             sys.exit()
+                subprocess.Popen([bat_script_path], shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
+                self.stop_event.set()
+                self.probe_stop_event.set()
+                self.db.stop()
+                self.destroy()
+                sys.exit()
                 
-    #     except Exception as e:
-    #         messagebox.showerror("Update Interrupted", f"Could not complete installation:\n{e}")
-    #         self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
+        except Exception as e:
+            messagebox.showerror("Update Interrupted", f"Could not complete installation:\n{e}")
+            self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
 
     def _play_feedback_sound(self, is_success=True):
         """Plays a native Windows beep pattern if audio feedback is enabled."""
