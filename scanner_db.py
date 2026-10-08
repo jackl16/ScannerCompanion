@@ -23,12 +23,16 @@ import re
 
 from supabase import create_client, Client
 
-if getattr(sys, "frozen", False):
+if sys.platform == "darwin":
+    BASE_DIR = Path.home() / "Library" / "Application Support" / "ScannerCompanion"
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+elif getattr(sys, "frozen", False):
     # running as a PyInstaller-built .exe -- look next to the exe itself,
-    # not inside the temp folder PyInstaller extracts to at runtime
+    # not inside the temp folder PyInstaller extracts to at runtime    
     BASE_DIR = Path(sys.executable).parent
 else:
     BASE_DIR = Path(__file__).parent
+
 
 CONFIG_PATH = BASE_DIR / "scanner_config.toml"
 SESSION_FILE = BASE_DIR / "scanner_session.json"  # holds the remember-me refresh token

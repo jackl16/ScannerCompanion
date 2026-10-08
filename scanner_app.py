@@ -30,14 +30,52 @@ import sys
 from pathlib import Path
 
 
-import winsound
+try:
+    import winsound
+except ImportError:
+    winsound = None
 
 import serial
 import serial.tools.list_ports
 
 from scanner_db import ScannerDB
 
-FONT = "Segoe UI"
+
+def resource_path(name: str) -> Path:
+    """Where a bundled data file lives: PyInstaller's extraction folder
+    when frozen, otherwise next to this script."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / name
+
+def open_path(path) -> None:
+    """Open a file or folder with the OS default app."""
+    if sys.platform == "win32":
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", str(path)])
+    else:
+        subprocess.run(["xdg-open", str(path)])
+
+def list_scanner_ports():
+    """Serial ports worth probing as barcode scanners.
+
+    Windows/Linux: everything pyserial reports, same as before.
+    macOS: only the /dev/cu.* callout devices, minus the built-in
+    Bluetooth and debug entries. macOS lists each device twice
+    (tty.* and cu.*), and the tty.* version can block on open.
+    """
+    ports = serial.tools.list_ports.comports()
+    if sys.platform == "darwin":
+        ports = [
+            p for p in ports
+            if p.device.startswith("/dev/cu.")
+            and "bluetooth" not in p.device.lower()
+            and "debug-console" not in p.device.lower()
+        ]
+    return sorted(ports, key=lambda p: p.device)        
+
+FONT = "Segoe UI" if sys.platform == "win32" else "Helvetica Neue"
+MONO = "Consolas" if sys.platform == "win32" else "Menlo"
 
 # Minimum time between two accepted reads on the *same physical port*.
 # Cheap USB barcode scanners occasionally double-fire on a single swipe
@@ -298,7 +336,7 @@ class ScannerApp(tk.Tk):
             bg=COLORS["card"], fg=COLORS["log_text"],
             selectbackground="#0056b3", selectforeground=COLORS["on_primary"], # Fixed selection color here
             highlightthickness=0,bd=0,
-            relief="flat", borderwidth=0, font=("Consolas", 10),
+            relief="flat", borderwidth=0, font=(MONO, 10),
         )
 
     def _header(self, text: str):
@@ -405,7 +443,7 @@ class ScannerApp(tk.Tk):
         ports_card = ttk.Frame(frame, style="Card.TFrame", padding=14)
         ports_card.pack(fill="x", pady=(0, 12))
 
-        available_ports = serial.tools.list_ports.comports()
+        available_ports = list_scanner_ports()
         if not available_ports:
             ttk.Label(
                 ports_card, style="Card.TLabel",
@@ -580,7 +618,8 @@ class ScannerApp(tk.Tk):
         def _on_mouse_wheel(event):
             # Windows sends mouse delta movements in factors of 120
             # Dividing by -120 converts it into a uniform single line scroll step
-            self.log_list.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            step = -event.delta if sys.platform == "darwin" else int(-event.delta / 120)
+            self.log_list.yview_scroll(step, "units")
             
         self.log_list.bind("<MouseWheel>", _on_mouse_wheel)
         
@@ -747,13 +786,14 @@ class ScannerApp(tk.Tk):
         
         messagebox.showinfo(title, message)
 
+
     def _open_setup_guide(self):
-        """Automatically launches the documentation file or a web link in the user's browser."""
-
-
-
-        if os.path.exists("README.txt"):
-            os.startfile("README.txt")
+        guide = resource_path("README.txt")
+        if guide.exists():
+            try:
+                open_path(guide)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open the guide:\n{e}")
         else:
             messagebox.showerror("Error", "Documentation file 'README.txt' could not be found.")
 
@@ -876,6 +916,10 @@ class ScannerApp(tk.Tk):
     def _apply_background_update(self, download_url):
         """Downloads the new binary executable into a temp folder and triggers the file-swap batch handler."""
 
+        if sys.platform != "win32":
+            import webbrowser
+            webbrowser.open(download_url)
+            return     
         
         try:
             # Update footer display state visually so the user doesn't close it mid-stream
@@ -933,12 +977,11 @@ class ScannerApp(tk.Tk):
         
         def run_sound():
             try:
-                if is_success:
-                    # High pitched, quick chirp (Frequency 1000Hz, Duration 150ms)
-                    winsound.Beep(1000, 150)
-                else:
-                    # Lower pitched, longer warning buzzer sound (Frequency 400Hz, Duration 400ms)
-                    winsound.Beep(400, 400)
+                if winsound:
+                    winsound.Beep(1000, 150) if is_success else winsound.Beep(400, 400)
+                elif sys.platform == "darwin":
+                    name = "Glass" if is_success else "Basso"
+                    subprocess.Popen(["afplay", f"/System/Library/Sounds/{name}.aiff"])
             except Exception:
                 pass # Fail silently if system audio drivers are locked down
                 
