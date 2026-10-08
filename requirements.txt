@@ -1,0 +1,6 @@
+supabase
+pyserial
+tomli_w
+requests
+pillow
+tzdata
