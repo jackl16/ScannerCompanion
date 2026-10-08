@@ -1,0 +1,25 @@
+name: Build Mac app
+on:
+  workflow_dispatch:      # adds a "Run workflow" button in the Actions tab
+jobs:
+  build:
+    runs-on: macos-latest   # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - name: Build
+        run: |
+          pyinstaller --windowed --noconfirm \
+            --name "Scanner Companion" \
+            --add-data "README.txt:." \
+            --add-data "scanner_config.mac.toml:." \
+            scanner_app.py
+      - name: Zip
+        run: ditto -c -k --keepParent "dist/Scanner Companion.app" ScannerCompanion-mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScannerCompanion-mac
+          path: ScannerCompanion-mac.zip
