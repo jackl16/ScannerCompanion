@@ -21,7 +21,7 @@ import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 from datetime import datetime
 import os           
 import requests
@@ -38,7 +38,8 @@ except ImportError:
 import serial
 import serial.tools.list_ports
 
-from scanner_db import ScannerDB
+from scanner_db import ScannerDB, BASE_DIR
+from features import check_feature_code
 
 
 def _ver(v) -> tuple:
@@ -193,6 +194,11 @@ class ScannerApp(tk.Tk):
         # loaded from scanner_config.toml, so the toggle survives restarts
         # instead of silently resetting to off every launch
         self.sound_enabled = tk.BooleanVar(value=self.db.sound_enabled)
+        self.photo_mode_var = tk.BooleanVar(value=self.db.photo_mode)
+        self._photo_toggle_added = False
+        self._photo_busy = False
+        self.photo_worker = None
+
 
         self.scan_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -277,6 +283,12 @@ class ScannerApp(tk.Tk):
 
         style.configure("TSeparator", background=COLORS["border"])
 
+        style.configure(
+            "DarkEntry.TEntry", fieldbackground=COLORS["card"], foreground="#ffffff",
+            insertcolor="#ffffff", bordercolor=COLORS["border"],
+            lightcolor=COLORS["border"], darkcolor=COLORS["border"],
+        )
+
     def _make_menu(self) -> tk.Menu:
         """Plain tk.Menu -- used both for the native top menu bar's dropdowns
         and, later, for any popup menus. tk.Menu doesn't take ttk styling,
@@ -299,13 +311,19 @@ class ScannerApp(tk.Tk):
 
 
         settings_menu = self._make_menu()
+        self.settings_menu = settings_menu
         settings_menu.add_command(label="🔎 Detect Scanner", command=self._show_scanner_setup_screen)
         settings_menu.add_separator()
         settings_menu.add_checkbutton(
-            label="Enable Audio Feedback", 
+            label="Enable Audio Feedback",
             variable=self.sound_enabled,
             command=lambda: self.db.save_sound_enabled(self.sound_enabled.get()),
-        )        
+        )
+        settings_menu.add_separator()
+        settings_menu.add_command(label="🔑 Add Feature...", command=self._prompt_feature_code)
+        self._photo_toggle_added = False
+        if self.db.photo_unlocked:
+            self._add_photo_toggle()
         menu_bar.add_cascade(label="Settings", menu=settings_menu)
 
         # Status -- one entry per port, updated live as scans/errors come in.
@@ -603,6 +621,8 @@ class ScannerApp(tk.Tk):
         # Offline-queue indicator -- blank when nothing is queued
         self.pending_label = tk.Label(self.status_bar, text="", font=(FONT, 9, "bold"), bg=COLORS["card"])
         self.pending_label.pack(side=tk.LEFT, padx=(12, 4), pady=4)
+        self.mode_label = tk.Label(self.status_bar, text="", font=(FONT, 9, "bold"), bg=COLORS["card"])
+        self.mode_label.pack(side=tk.LEFT, padx=(12, 4), pady=4)
 
         # Version tag, tucked in the corner
         tk.Label(
@@ -611,7 +631,7 @@ class ScannerApp(tk.Tk):
         ).pack(side=tk.RIGHT, padx=(2, 10), pady=4)
         # ---------------------------------------
 
-        log_frame = ttk.Frame(self, padding=20)
+        self.log_frame = log_frame = ttk.Frame(self, padding=20)
         log_frame.pack(fill="both", expand=True, padx=20, pady=20)
         ttk.Label(log_frame, text="Scan Log", font=(FONT, 10, "bold")).pack(anchor="w")
 
@@ -630,11 +650,13 @@ class ScannerApp(tk.Tk):
             self.log_list.yview_scroll(step, "units")
             
         self.log_list.bind("<MouseWheel>", _on_mouse_wheel)
-        
+
+        self._build_photo_search_bar()
         self._start_reader_threads()
         self._log(f"Signed in. Listening on: {', '.join(self.db.serial_ports)}")
         self._poll_job = self.after(100, self._poll_queue)
         self._update_pending_label()
+        self._refresh_mode_indicator()
         self._flush_job = self.after(20000, self._periodic_flush)
 
 
@@ -729,6 +751,243 @@ class ScannerApp(tk.Tk):
         if hasattr(self, 'log_list'):
             self.log_list.delete(0, tk.END)
 
+    # --- PHOTO CAPTURE FEATURE ------------------------------------------
+
+    def _prompt_feature_code(self):
+        code = simpledialog.askstring("Add Feature", "Enter your feature code:", parent=self, show="*")
+        if not code:
+            return
+        if check_feature_code(code) == "drive_photos":
+            self.db.unlock_photo_feature()
+            self._add_photo_toggle()
+            messagebox.showinfo("Feature added",
+                                "Photo Capture is now available under Settings. Turn it on there when you're ready.")
+        else:
+            messagebox.showerror("Add Feature", "That code isn't valid.")
+
+    def _add_photo_toggle(self):
+        if self._photo_toggle_added:
+            return
+        self.settings_menu.add_checkbutton(
+            label="📷 Photo Capture Mode",
+            variable=self.photo_mode_var,
+            command=self._on_photo_mode_toggled,
+        )
+        self._photo_toggle_added = True
+
+    def _on_photo_mode_toggled(self):
+        enabled = self.photo_mode_var.get()
+        if enabled:
+            if not messagebox.askyesno(
+                "Photo Capture Mode",
+                "While this is on, scans will NOT check students in or out.\n"
+                "They will only open the camera for that student.\n\nTurn it on?"
+            ) or not self._ensure_photo_backend():
+                self.photo_mode_var.set(False)
+                enabled = False
+        self.db.save_photo_mode(enabled)
+        self._refresh_mode_indicator()
+        self._log("📷 Photo mode ON - scans find students for photos, no check-in/out" if enabled
+                  else "Photo mode OFF - scans check students in/out")
+
+    def _refresh_mode_indicator(self):
+        if not hasattr(self, "mode_label") or not self.mode_label.winfo_exists():
+            return
+        if self.photo_mode_var.get():
+            self.mode_label.config(text="📷 PHOTO MODE (no check-in)", fg=COLORS["warning"])
+            self.photo_search_frame.pack(fill="x", before=self.log_frame)
+        else:
+            self.mode_label.config(text="")
+            self.photo_search_frame.pack_forget()
+
+    def _ensure_photo_backend(self) -> bool:
+        """Connects to Google Drive the first time it's needed (may open a browser to sign in)."""
+        if self.photo_worker is not None:
+            return True
+        try:
+            from photo_capture import DriveStore, UploadWorker, CREDS_FILE, TOKEN_FILE
+            if not (os.path.exists(CREDS_FILE) or os.path.exists(TOKEN_FILE)):
+                messagebox.showerror("Photo Capture", f"credentials.json was not found.\n\nPlace it in:\n{BASE_DIR}")
+                return False
+            if not os.path.exists(TOKEN_FILE):
+                messagebox.showinfo("Photo Capture",
+                                    "A browser window will open. Sign in to the Google account that should store the photos.")
+            self.config(cursor="watch")
+            self.update_idletasks()
+            self.photo_worker = UploadWorker(DriveStore())
+            return True
+        except Exception as e:
+            messagebox.showerror("Photo Capture", f"Couldn't connect to Google Drive:\n{e}")
+            return False
+        finally:
+            self.config(cursor="")
+
+    def _handle_photo_scan(self, raw_scan: str):
+        code = raw_scan.strip()
+
+        if self._photo_busy:
+            self.status_label.config(text="Finish the current photo first - scan ignored.", fg=COLORS["warning"])
+            return
+        if not code.isdigit():
+            self.status_label.config(text="Photo mode: staff and unknown codes are ignored.", fg=COLORS["warning"])
+            return
+
+        try:
+            student = self.db.find_student_fresh(code)
+        except Exception as e:
+            self._play_feedback_sound(is_success=False)
+            self.status_label.config(text=f"Lookup failed: {e}", fg=COLORS["error"])
+            return
+
+        if student is None:
+            self._play_feedback_sound(is_success=False)
+            msg = f"Student code {code} not found."
+            self.status_label.config(text=msg, fg=COLORS["error"])
+            self._log(msg)
+            return
+
+        self._start_photo_for_student(student)
+
+    def _start_photo_for_student(self, student: dict):
+        """Shared by scans, typed barcodes and name search: opens the camera for each subject."""
+        if self._photo_busy:
+            self.status_label.config(text="Finish the current photo first.", fg=COLORS["warning"])
+            return
+        if self.db.is_withdrawn(student):
+            self._play_feedback_sound(is_success=False)
+            msg = f"{student.get('first_name', '')} {student.get('last_name', '')} is withdrawn - no photo taken."
+            self.status_label.config(text=msg, fg=COLORS["error"])
+            self._log(msg)
+            return
+        if not self._ensure_photo_backend():
+            return
+
+        from photo_capture import PhotoDialog, student_photo_info
+
+        try:
+            info = student_photo_info(student)
+        except Exception as e:
+            self._play_feedback_sound(is_success=False)
+            self.status_label.config(text=f"Student data problem: {e}", fg=COLORS["error"])
+            return
+
+        label = f"{info['last']}, {info['first']}"
+        subjects = list(info["subjects"])
+        if not subjects:
+            self._play_feedback_sound(is_success=False)
+            msg = f"{label}: no Math or Reading marked"
+            self.status_label.config(text=msg, fg=COLORS["warning"])
+            self._log(msg)
+            return
+
+        self._play_feedback_sound(is_success=True)
+        self.status_label.config(text=f"Found: {label} ({' + '.join(subjects)})", fg=COLORS["success"])
+        self._photo_busy = True
+
+        def next_subject():
+            if not subjects:
+                self._photo_busy = False
+                self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
+                if hasattr(self, "photo_search_entry") and self.photo_search_entry.winfo_exists():
+                    self.photo_search_entry.focus_set()
+                return
+            subject = subjects.pop(0)
+
+            def done(jpeg):
+                if jpeg:
+                    self.photo_worker.submit(info["id"], info["last"], info["first"], subject, jpeg, info["barcode"])
+                    self._log(f"📷 {label}: {subject} photo captured, uploading")
+                else:
+                    self._log(f"{label}: {subject} photo skipped")
+                next_subject()
+
+            try:
+                PhotoDialog(self, f"{subject} - {label}", done)
+            except Exception as e:
+                self._photo_busy = False
+                self._log(f"Camera error: {e}")
+
+        next_subject()
+
+    def _build_photo_search_bar(self):
+        """Created on every scanner screen build, but only shown while photo mode is on."""
+        self.photo_search_frame = ttk.Frame(self, padding=(20, 12, 20, 0))
+        ttk.Label(self.photo_search_frame, text="Type a barcode or student name, then press Enter:",
+                  style="Muted.TLabel").pack(anchor="w")
+        row = ttk.Frame(self.photo_search_frame)
+        row.pack(fill="x", pady=(4, 0))
+        self.photo_search_var = tk.StringVar()
+        self.photo_search_entry = ttk.Entry(row, textvariable=self.photo_search_var, style="DarkEntry.TEntry")
+        self.photo_search_entry.pack(side="left", fill="x", expand=True)
+        self.photo_search_entry.bind("<Return>", self._on_photo_search)
+        ttk.Button(row, text="Find", command=self._on_photo_search).pack(side="left", padx=(8, 0))
+
+    def _on_photo_search(self, event=None):
+        query = self.photo_search_var.get().strip()
+        if not query:
+            return
+        if self._photo_busy:
+            self.status_label.config(text="Finish the current photo first.", fg=COLORS["warning"])
+            return
+        self.photo_search_var.set("")
+
+        if query.isdigit():
+            self._handle_photo_scan(query)  # typed barcode: same path as a scan
+            return
+
+        try:
+            matches = self.db.search_students(query)
+        except Exception as e:
+            self.status_label.config(text=f"Search failed: {e}", fg=COLORS["error"])
+            return
+
+        if not matches:
+            self.status_label.config(text=f"No student matching '{query}'.", fg=COLORS["error"])
+        elif len(matches) == 1:
+            self._start_photo_for_student(matches[0])
+        else:
+            self._show_student_picker(matches)
+
+    def _show_student_picker(self, matches: list):
+        win = tk.Toplevel(self)
+        win.title("Choose a student")
+        win.configure(bg=COLORS["bg"])
+        win.transient(self)
+        ttk.Label(win, text="Multiple matches - pick one:", style="Muted.TLabel").pack(
+            anchor="w", padx=12, pady=(12, 4))
+
+        lb = tk.Listbox(win, width=48, height=min(12, len(matches)))
+        self._style_listbox(lb)
+        lb.pack(padx=12, pady=4)
+        for s in matches:
+            grade = f"   Gr {s['grade']}" if s.get("grade") else ""
+            lb.insert(tk.END, f"{s.get('last_name', '')}, {s.get('first_name', '')}  "
+                              f"({s.get('barcode_code', '')}){grade}")
+        lb.selection_set(0)
+        lb.focus_set()
+
+        def choose(event=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            student = matches[sel[0]]
+            win.destroy()
+            self._start_photo_for_student(student)
+
+        lb.bind("<Double-Button-1>", choose)
+        lb.bind("<Return>", choose)
+        win.bind("<Escape>", lambda e: win.destroy())
+        ttk.Button(win, text="Select", command=choose).pack(pady=(4, 12))
+
+    def _finish_photo_uploads(self, max_wait=20):
+        """Gives queued uploads a few seconds to finish before the app closes or updates."""
+        if self.photo_worker is None:
+            return
+        deadline = time.time() + max_wait
+        while self.photo_worker.q.unfinished_tasks and time.time() < deadline:
+            time.sleep(0.2)
+
+
     def _logout(self):
         if not messagebox.askyesno("Log out", "Are you sure you want to log out?"):
             return
@@ -738,6 +997,10 @@ class ScannerApp(tk.Tk):
 
 
     def _handle_scan(self, raw_scan: str):
+        if self.photo_mode_var.get():
+            self._handle_photo_scan(raw_scan)
+            return
+
         # Change foreground to fg here
         self.status_label.config(text=f"Processing '{raw_scan}'...", fg=COLORS["text_muted"])
 
@@ -967,6 +1230,7 @@ class ScannerApp(tk.Tk):
                     bat_file.write(bat_content)
 
                 subprocess.Popen([bat_script_path], shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
+                self._finish_photo_uploads()                
                 self.stop_event.set()
                 self.probe_stop_event.set()
                 self.db.stop()
@@ -1012,6 +1276,7 @@ class ScannerApp(tk.Tk):
         for widget in self.winfo_children():
             widget.destroy()
     def _on_close(self):
+        self._finish_photo_uploads()
         self.stop_event.set()
         self.probe_stop_event.set()
         self.db.stop()  # stop the token-refresh background thread too

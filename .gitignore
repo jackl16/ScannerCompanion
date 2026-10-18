@@ -183,3 +183,5 @@ cython_debug/
 
 scanner_session.json
 scanner_config.toml
+token.json
+credentials.json
