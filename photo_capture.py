@@ -18,8 +18,13 @@ import queue
 import threading
 import time
 import tkinter as tk
+import subprocess
+import sys
+import tempfile
+from collections import OrderedDict
+
 from datetime import datetime
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 
 from scanner_db import BASE_DIR as BASE
 
@@ -51,6 +56,7 @@ MATH_COL, READING_COL = "math", "reading"  # a Y (or true) means the student doe
 
 class DriveStore:
     def __init__(self, keep_copies=KEEP_COPIES):
+        self._lock = threading.Lock()
         self.keep = keep_copies
         self._cache = {}  # key -> (folder_id, name): saves Drive round trips
         self.svc = build("drive", "v3", credentials=self._creds(), cache_discovery=False)
@@ -94,7 +100,11 @@ class DriveStore:
         self._cache[key] = (fid, name)
         return fid
 
-    def upload(self, student_id, last, first, subject, jpeg, barcode=None):
+    def upload(self, *args, **kwargs):
+        with self._lock:
+            return self._upload(*args, **kwargs)
+
+    def _upload(self, student_id, last, first, subject, jpeg, barcode=None):
         """Saves to <root>/<First, Last (ID)>/<subject>/ and keeps only the newest N photos per subject."""
         try:
             label = student_id
@@ -111,6 +121,23 @@ class DriveStore:
             self._cache.clear()  # a folder may have been moved or deleted in Drive: look up fresh on retry
             raise
 
+    def list_children(self, parent_id, folders_only=False, newest_first=False):
+        """One API call: everything directly inside a folder (up to 1000 items)."""
+        q = f"'{parent_id}' in parents and trashed=false"
+        if folders_only:
+            q += f" and mimeType='{FOLDER_MIME}'"
+        with self._lock:
+            resp = self.svc.files().list(
+                q=q, pageSize=1000,
+                orderBy="createdTime desc" if newest_first else "name_natural",
+                fields="files(id,name,mimeType,createdTime,appProperties)",
+            ).execute(num_retries=3)
+        return resp.get("files", [])
+
+    def download(self, file_id):
+        """One API call: the file's bytes."""
+        with self._lock:
+            return self.svc.files().get_media(fileId=file_id).execute(num_retries=3)
 
 def _jpeg(frame):
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -250,3 +277,219 @@ def student_photo_info(row: dict) -> dict:
         "last": row[LAST_COL],
         "subjects": subjects,
     }
+
+# -------------------- External opening files functionality -----
+
+def _open_external(path):
+    if sys.platform == "win32":
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", path])
+    else:
+        subprocess.run(["xdg-open", path])
+
+
+class PhotoBrowser(ttk.Frame):
+    """Lazy Drive browser: students -> subject folders -> photos.
+    One API call per folder expanded and per photo opened. All Drive work runs on
+    background threads and reports back through a queue polled on the Tk thread."""
+
+    def __init__(self, parent, get_store, get_visible_students):
+        super().__init__(parent)
+        self.get_store = get_store                          # -> DriveStore or None
+        self.get_visible_students = get_visible_students    # -> {s_id: "First Last (barcode)"}
+        self.meta = {}                  # tree item id -> {"kind", "id", "name"}
+        self._q = queue.Queue()
+        self._cache = OrderedDict()     # photo file id -> bytes (last 30)
+        self._want = None               # photo currently selected for preview
+        self._loading = set()
+        self._job = None
+        self._img = None
+
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(self)
+        left.grid(row=0, column=0, sticky="ns", padx=(0, 10))
+        bar = ttk.Frame(left)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Refresh", command=self.refresh).pack(side="left")
+        self.status = ttk.Label(bar, text="Click Refresh to load", style="Muted.TLabel")
+        self.status.pack(side="left", padx=8)
+
+        box = ttk.Frame(left)
+        box.pack(fill="both", expand=True, pady=(6, 0))
+        self.tree = ttk.Treeview(box, show="tree", selectmode="browse")
+        self.tree.column("#0", width=280, stretch=True)
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        self.preview = ttk.Label(self, text="Select a photo", style="Muted.TLabel", anchor="center")
+        self.preview.grid(row=0, column=1, sticky="nsew")
+
+        self.tree.bind("<<TreeviewOpen>>", self._on_open)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Double-1>", self._on_double_click)
+        self.bind("<Destroy>", self._on_destroy)
+        self._poll()
+
+    # --- background plumbing ---
+
+    def _run(self, fn, *args):
+        def worker():
+            try:
+                self._q.put(fn(*args))
+            except Exception as e:
+                self._q.put(("error", str(e)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _poll(self):
+        try:
+            while True:
+                self._handle(self._q.get_nowait())
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self._job = self.after(100, self._poll)
+
+    def _on_destroy(self, event):
+        if event.widget is self and self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+
+    # --- loading ---
+
+    def refresh(self):
+        store = self.get_store()
+        if store is None:
+            self.status.config(text="Drive not connected")
+            return
+        try:
+            visible = self.get_visible_students()
+        except Exception as e:
+            self.status.config(text=f"Student list failed: {e}")
+            return
+        self.tree.delete(*self.tree.get_children())
+        self.meta.clear()
+        self._loading.clear()
+        self.status.config(text="Loading...")
+        self._run(self._fetch_root, store, visible)
+
+    def _fetch_root(self, store, visible):
+        rows = []
+        for f in store.list_children(store.root_id, folders_only=True):
+            key = (f.get("appProperties") or {}).get("kt_key", "").split(":")
+            if len(key) == 2 and key[0] == "student" and key[1] in visible:
+                rows.append((visible[key[1]], f["id"]))
+        rows.sort(key=lambda r: r[0].lower())
+        return ("root", rows)
+
+    def _on_open(self, event):
+        iid = self.tree.focus()
+        meta = self.meta.get(iid)
+        if not meta or meta["kind"] == "photo" or iid in self._loading:
+            return
+        store = self.get_store()
+        if store is None:
+            return
+        self._loading.add(iid)
+        self.status.config(text="Loading...")
+        self._run(self._fetch_children, store, iid, meta)
+
+    def _fetch_children(self, store, iid, meta):
+        if meta["kind"] == "student":
+            items = store.list_children(meta["id"], folders_only=True)
+        else:
+            items = store.list_children(meta["id"], newest_first=True)
+        return ("children", iid, items)
+
+    def _on_select(self, event):
+        sel = self.tree.selection()
+        meta = self.meta.get(sel[0]) if sel else None
+        if meta and meta["kind"] == "photo":
+            self._show_photo(meta["id"], external=False)
+
+    def _on_double_click(self, event):
+        meta = self.meta.get(self.tree.identify_row(event.y))
+        if meta and meta["kind"] == "photo":
+            self._show_photo(meta["id"], external=True)
+
+    def _show_photo(self, fid, external):
+        if not external:
+            self._want = fid
+        if fid in self._cache:
+            self._cache.move_to_end(fid)
+            self._deliver(fid, self._cache[fid], external)
+            return
+        store = self.get_store()
+        if store is None:
+            return
+        self.status.config(text="Loading photo...")
+        self._run(self._fetch_image, store, fid, external)
+
+    def _fetch_image(self, store, fid, external):
+        return ("image", fid, store.download(fid), external)
+
+    # --- results (always on the Tk thread) ---
+
+    def _handle(self, msg):
+        kind = msg[0]
+        if kind == "root":
+            for label, fid in msg[1]:
+                iid = self.tree.insert("", "end", text=label)
+                self.meta[iid] = {"kind": "student", "id": fid}
+                self.tree.insert(iid, "end", text="Loading...")
+            self.status.config(text=f"{len(msg[1])} students with photos")
+        elif kind == "children":
+            _, iid, items = msg
+            self._loading.discard(iid)
+            if not self.tree.exists(iid):
+                return
+            self.tree.delete(*self.tree.get_children(iid))
+            parent_kind = self.meta[iid]["kind"]
+            for it in items:
+                if parent_kind == "student":
+                    child = self.tree.insert(iid, "end", text=it["name"])
+                    self.meta[child] = {"kind": "subject", "id": it["id"]}
+                    self.tree.insert(child, "end", text="Loading...")
+                else:
+                    child = self.tree.insert(iid, "end", text=self._pretty_time(it["name"]))
+                    self.meta[child] = {"kind": "photo", "id": it["id"]}
+            if not items:
+                self.tree.insert(iid, "end", text="(nothing here yet)")
+            self.status.config(text="")
+        elif kind == "image":
+            _, fid, data, external = msg
+            self._cache[fid] = data
+            while len(self._cache) > 30:
+                self._cache.popitem(last=False)
+            self._deliver(fid, data, external)
+            self.status.config(text="")
+        elif kind == "error":
+            self._loading.clear()
+            self.status.config(text=f"Error: {msg[1]}")
+
+    def _deliver(self, fid, data, external):
+        if external:
+            path = os.path.join(tempfile.gettempdir(), f"scanner_photo_{fid}.jpg")
+            with open(path, "wb") as f:
+                f.write(data)
+            _open_external(path)
+        elif fid == self._want:
+            img = Image.open(io.BytesIO(data))
+            img.thumbnail((max(self.preview.winfo_width() - 10, 200),
+                           max(self.preview.winfo_height() - 10, 200)))
+            self._img = ImageTk.PhotoImage(img)  # keep a reference or Tk drops it
+            self.preview.config(image=self._img, text="")
+
+    @staticmethod
+    def _pretty_time(name):
+        try:
+            stamp = datetime.strptime(name.rsplit(".", 1)[0], "%Y-%m-%d_%H-%M-%S")
+            return stamp.strftime("%b %d, %Y  %I:%M %p")
+        except ValueError:
+            return name

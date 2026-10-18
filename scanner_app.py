@@ -289,6 +289,11 @@ class ScannerApp(tk.Tk):
             lightcolor=COLORS["border"], darkcolor=COLORS["border"],
         )
 
+        style.configure("Treeview", background=COLORS["card"], fieldbackground=COLORS["card"],
+                        foreground=COLORS["text"], borderwidth=0, rowheight=24)
+        style.map("Treeview", background=[("selected", COLORS["primary"])],
+                  foreground=[("selected", COLORS["on_primary"])])
+
     def _make_menu(self) -> tk.Menu:
         """Plain tk.Menu -- used both for the native top menu bar's dropdowns
         and, later, for any popup menus. tk.Menu doesn't take ttk styling,
@@ -651,7 +656,7 @@ class ScannerApp(tk.Tk):
             
         self.log_list.bind("<MouseWheel>", _on_mouse_wheel)
 
-        self._build_photo_search_bar()
+        #self._build_photo_search_bar()
         self._start_reader_threads()
         self._log(f"Signed in. Listening on: {', '.join(self.db.serial_ports)}")
         self._poll_job = self.after(100, self._poll_queue)
@@ -790,15 +795,59 @@ class ScannerApp(tk.Tk):
         self._log("📷 Photo mode ON - scans find students for photos, no check-in/out" if enabled
                   else "Photo mode OFF - scans check students in/out")
 
+    def _widget_alive(self, name):
+        w = getattr(self, name, None)
+        return w is not None and w.winfo_exists()
+
     def _refresh_mode_indicator(self):
-        if not hasattr(self, "mode_label") or not self.mode_label.winfo_exists():
+        if not self._widget_alive("mode_label"):
             return
         if self.photo_mode_var.get():
             self.mode_label.config(text="📷 PHOTO MODE (no check-in)", fg=COLORS["warning"])
+            self._ensure_photo_widgets()
             self.photo_search_frame.pack(fill="x", before=self.log_frame)
+            self.photo_browser.pack(fill="both", expand=True, padx=20, pady=(8, 0), before=self.log_frame)
+            self.log_frame.configure(padding=(10, 6))
+            self.log_frame.pack_configure(expand=False, padx=20, pady=(8, 12))
+            self.log_list.config(height=6)
+            self.resizable(True, True)
+            self.minsize(760, 620)
+            self.geometry("900x720")
         else:
             self.mode_label.config(text="")
-            self.photo_search_frame.pack_forget()
+            for name in ("photo_search_frame", "photo_browser"):
+                if self._widget_alive(name):
+                    getattr(self, name).pack_forget()
+            self.log_frame.configure(padding=20)
+            self.log_frame.pack_configure(expand=True, padx=20, pady=20)
+            self.log_list.config(height=10)
+            self.minsize(1, 1)
+            self.resizable(False, False)
+            self.geometry("560x560")
+
+    def _ensure_photo_widgets(self):
+        if not self._widget_alive("photo_search_frame"):
+            self._build_photo_search_bar()
+        if not self._widget_alive("photo_browser"):
+            self._build_photo_browser()
+
+    def _build_photo_browser(self):
+        from photo_capture import PhotoBrowser
+        self.photo_browser = PhotoBrowser(
+            self,
+            get_store=lambda: self.photo_worker.store if self._ensure_photo_backend() else None,
+            get_visible_students=self._visible_photo_students,
+        )
+
+    def _visible_photo_students(self) -> dict:
+        """s_id -> display label, for active students only (withdrawn are never listed)."""
+        out = {}
+        for s in self.db.get_students():
+            if self.db.is_withdrawn(s):
+                continue
+            out[str(s["s_id"])] = (f"{s.get('first_name', '')} {s.get('last_name', '')} "
+                                   f"({s.get('barcode_code', '')})")
+        return out
 
     def _ensure_photo_backend(self) -> bool:
         """Connects to Google Drive the first time it's needed (may open a browser to sign in)."""
