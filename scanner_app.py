@@ -13,7 +13,7 @@ Run:
 import requests
 from tkinter import messagebox
 
-CURRENT_VERSION = "1.0.3"
+CURRENT_VERSION = "1.0.4"
 MANIFEST_URL = "https://raw.githubusercontent.com/jackl16/ScannerCompanion/refs/heads/main/version.json"
 
 import csv
@@ -40,6 +40,13 @@ import serial.tools.list_ports
 
 from scanner_db import ScannerDB
 
+
+def _ver(v) -> tuple:
+    """'1.0.10' -> (1, 0, 10), so versions compare numerically."""
+    try:
+        return tuple(int(p) for p in str(v).strip().lstrip("v").split("."))
+    except ValueError:
+        return (0,)
 
 def resource_path(name: str) -> Path:
     """Where a bundled data file lives: PyInstaller's extraction folder
@@ -190,6 +197,8 @@ class ScannerApp(tk.Tk):
         self.scan_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.reader_threads = []
+        self._poll_job = None
+        self._flush_job = None
 
         # separate queue/stop-event for the detection screen, so probing
         # never gets tangled up with the live scanner listeners
@@ -389,15 +398,14 @@ class ScannerApp(tk.Tk):
         pw_entry.pack(pady=(2, 10))
 
         remember_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(card, text="Remember me for 30 days", variable=remember_var).pack(pady=(0, 12), anchor="w")
+        ttk.Checkbutton(card, text="Remember me", variable=remember_var).pack(pady=(0, 12), anchor="w")
 
         error_label = ttk.Label(card, text="", style="Card.TLabel", foreground=COLORS["error"])
         error_label.pack()
 
         def try_login(event=None):
+            self.db._remember = remember_var.get()  # must be set BEFORE sign_in
             if self.db.sign_in(email_var.get(), pw_var.get()):
-                if remember_var.get():
-                    self.db.remember_session(self.db._last_refresh_token)
                 if self.db.serial_ports:
                     self._show_scanner_screen()
                 else:
@@ -625,9 +633,9 @@ class ScannerApp(tk.Tk):
         
         self._start_reader_threads()
         self._log(f"Signed in. Listening on: {', '.join(self.db.serial_ports)}")
-        self.after(100, self._poll_queue)
+        self._poll_job = self.after(100, self._poll_queue)
         self._update_pending_label()
-        self.after(20000, self._periodic_flush)
+        self._flush_job = self.after(20000, self._periodic_flush)
 
 
     def _start_reader_threads(self):
@@ -661,7 +669,7 @@ class ScannerApp(tk.Tk):
         except queue.Empty:
             pass
         finally:
-            self.after(100, self._poll_queue)
+            self._poll_job = self.after(100, self._poll_queue)
 
     def _periodic_flush(self):
         """Every 20s, try to drain the offline scan queue -- catches the
@@ -674,10 +682,10 @@ class ScannerApp(tk.Tk):
         except Exception:
             pass  # still offline, or a transient issue -- just try again next cycle
         self._update_pending_label()
-        self.after(20000, self._periodic_flush)
+        self._flush_job = self.after(20000, self._periodic_flush)
 
     def _update_pending_label(self):
-        if not hasattr(self, "pending_label"):
+        if not hasattr(self, "pending_label") or not self.pending_label.winfo_exists():
             return
         count = self.db.pending_count()
         if count:
@@ -877,7 +885,7 @@ class ScannerApp(tk.Tk):
                 download_url = data.get("url")
                 
                 # Check if the fetched server build string is higher than our native constant
-                if remote_version > CURRENT_VERSION:
+                if _ver(remote_version) > _ver(CURRENT_VERSION):
                     # Prompt the user with a standard confirmation popup dialog box
                     msg = f"A new software update (v{remote_version}) is available!\n\nWhat's New:\n{data.get('changelog')}\n\nWould you like to download and apply the update now?"
                     if messagebox.askyesno("Update Available", msg):
@@ -989,10 +997,20 @@ class ScannerApp(tk.Tk):
         # doesn't freeze for a split second while the speaker card activates
         threading.Thread(target=run_sound, daemon=True).start()
 
+    def _cancel_scanner_loops(self):
+        for job in (self._poll_job, self._flush_job):
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+        self._poll_job = None
+        self._flush_job = None
+
     def _clear_window(self):
+        self._cancel_scanner_loops()
         for widget in self.winfo_children():
             widget.destroy()
-
     def _on_close(self):
         self.stop_event.set()
         self.probe_stop_event.set()

@@ -110,6 +110,8 @@ class ScannerDB:
     def __init__(self):
         config = load_config()
         self.client: Client = create_client(config["supabase"]["url"], config["supabase"]["key"])
+        self._remember = False
+        self.client.auth.on_auth_state_change(self._on_auth_event)
         self.center_id = None
 
         self._students_cache = []
@@ -178,6 +180,7 @@ class ScannerDB:
             self.forget_remembered_session()
             return False
 
+        self._remember = True
         try:
             auth_resp = self.client.auth.refresh_session(refresh_token)
         except Exception as e:
@@ -199,10 +202,16 @@ class ScannerDB:
             self.forget_remembered_session()
             return False
 
-        success = self._finish_login(auth_resp.session)
-        if success:
-            self.remember_session(auth_resp.session.refresh_token)  # token may have rotated
-        else:
+        try:
+            success = self._finish_login(auth_resp.session)
+        except Exception as e:
+            # don't delete the saved login over a network blip
+            if not self._looks_like_network_error(e):
+                self.forget_remembered_session()
+            self.last_auth_error = "Couldn't reach the server. Try again."
+            return False
+
+        if not success:
             self.forget_remembered_session()
         return success
 
@@ -215,6 +224,16 @@ class ScannerDB:
     def _looks_like_network_error(e: Exception) -> bool:
         msg = str(e).lower()
         return any(marker in msg for marker in NETWORK_ERROR_MARKERS)
+
+    def _on_auth_event(self, event, session):
+        """Runs every time Supabase issues a new session (login or a
+        background refresh). Keeps the saved refresh token current so
+        remember-me doesn't go stale."""
+        if self._remember and session and event in ("SIGNED_IN", "TOKEN_REFRESHED"):
+            try:
+                self.remember_session(session.refresh_token)
+            except Exception:
+                pass
 
     def remember_session(self, refresh_token: str):
         SESSION_FILE.write_text(json.dumps({"refresh_token": refresh_token}))
@@ -258,9 +277,10 @@ class ScannerDB:
     def sign_out(self):
         """Signs out of Supabase, stops the token-refresh thread, and
         forgets the remembered session so the login screen shows again."""
+        self._remember = False
         self._stop_event.set()
         try:
-            self.client.auth.sign_out()
+            self.client.auth.sign_out({"scope": "local"})
         except Exception:
             pass  # best-effort -- still proceed with local cleanup either way
         self.forget_remembered_session()
@@ -316,22 +336,23 @@ class ScannerDB:
 
     # --- attendance ---
 
-    def get_today_attendance(self, s_id: int) -> dict | None:
-        today = self.local_date().isoformat()
+    def get_today_attendance(self, s_id: int, day: str | None = None) -> dict | None:
+        day = day or self.local_date().isoformat()
         resp = (
             self.client.table("attendance_logs")
             .select("*")
             .eq("center_id", self.center_id)
             .eq("s_id", s_id)
-            .eq("date", today)
+            .eq("date", day)
             .execute()
         )
         return resp.data[0] if resp.data else None
 
 
-    def set_attendance(self, s_id: int, **fields):
-        today = self.local_date().isoformat()
-        existing = self.get_today_attendance(s_id)
+
+    def set_attendance(self, s_id: int, day: str | None = None, **fields):
+        day = day or self.local_date().isoformat()
+        existing = self.get_today_attendance(s_id, day)
 
         if existing:
             self.client.table("attendance_logs").update(fields).eq("log_id", existing["log_id"]).execute()
@@ -340,7 +361,7 @@ class ScannerDB:
                 **fields,
                 "center_id": self.center_id,
                 "s_id": s_id,
-                "date": today,
+                "date": day,
             }).execute()
 
     # --- staff ---
@@ -367,21 +388,21 @@ class ScannerDB:
 
     # --- staff attendance  ---
 
-    def get_today_staff_attendance(self, staff_id: str) -> dict | None:
-        today = self.local_date().isoformat()
+    def get_today_staff_attendance(self, staff_id: str, day: str | None = None) -> dict | None:
+        day = day or self.local_date().isoformat()
         resp = (
             self.client.table("staff_time_logs")
             .select("*")
             .eq("center_id", self.center_id)
             .eq("staff_id", staff_id)
-            .eq("date", today)
+            .eq("date", day)
             .execute()
         )
         return resp.data[0] if resp.data else None
 
-    def set_staff_attendance(self, staff_id: str, **fields):
-        today = self.local_date().isoformat()
-        existing = self.get_today_staff_attendance(staff_id)
+    def set_staff_attendance(self, staff_id: str, day: str | None = None, **fields):
+        day = day or self.local_date().isoformat()
+        existing = self.get_today_staff_attendance(staff_id, day)
 
         if existing:
             self.client.table("staff_time_logs").update(fields).eq("log_id", existing["log_id"]).execute()
@@ -390,7 +411,7 @@ class ScannerDB:
                 **fields,
                 "center_id": self.center_id,
                 "staff_id": staff_id,
-                "date": today,
+                "date": day,
             }).execute()
 
     # --- offline buffer (JSON) -------------------------------------------
@@ -422,6 +443,12 @@ class ScannerDB:
                 "queued_at": self.local_now().isoformat(),
             })
             self._save_pending(pending)
+    
+    def _parse_queued_at(self, value) -> datetime | None:
+        try:
+            return datetime.fromisoformat(value).astimezone(LOCAL_TZ)
+        except Exception:
+            return None  # missing/corrupt -> fall back to "now"
 
     def flush_pending_scans(self) -> int:
         """Replays queued offline scans against Supabase, oldest first.
@@ -439,11 +466,12 @@ class ScannerDB:
             flushed = 0
             for entry in pending:
                 code = str(entry.get("code", ""))
+                when = self._parse_queued_at(entry.get("queued_at"))
                 try:
                     if STAFF_CODE_PATTERN.match(code):
-                        self._process_staff_scan(code)
+                        self._process_staff_scan(code, when)
                     elif code.isdigit():
-                        self._process_student_scan(code)
+                        self._process_student_scan(code, when)
                     # anything else was already invalid at queue time and
                     # would've been rejected before ever reaching the
                     # queue -- but drop it defensively just in case
@@ -492,41 +520,47 @@ class ScannerDB:
                 return "queued", f"⏳ Offline -- saved scan '{clean_scan}' to retry automatically"
             raise  # a genuine bug/data issue -- let the caller's generic handler surface it
 
-    def _process_student_scan(self, clean_code: str) -> tuple[str, str]:
+    def _process_student_scan(self, clean_code: str, when: datetime | None = None) -> tuple[str, str]:
+        when = when or self.local_now()
+        day = when.date().isoformat()
+        now_str = when.strftime("%H:%M:%S")
+
         student = self.find_student(clean_code)
         if student is None:
             return "not_found", f"Scanned code {clean_code} not found in student database."
 
         s_id = student["s_id"]
         display_name = student.get("first_name") or clean_code
-        existing = self.get_today_attendance(s_id)
+        existing = self.get_today_attendance(s_id, day)
         current_status = existing["attendance"] if existing else "No Show"
-        now_str = self.local_now().strftime("%H:%M:%S")
 
         if current_status in ("No Show", ""):
-            self.set_attendance(s_id, attendance="In", time_in=now_str)
+            self.set_attendance(s_id, day=day, attendance="In", time_in=now_str)
             return "checked_in", f"✅ Checked IN: {display_name}"
         elif current_status == "In":
-            self.set_attendance(s_id, attendance="Out", time_out=now_str)
+            self.set_attendance(s_id, day=day, attendance="Out", time_out=now_str)
             return "checked_out", f"👋 Checked OUT: {display_name}"
         else:
             return "already_done", f"ℹ️ {display_name} already logged as '{current_status}'"
 
-    def _process_staff_scan(self, staff_code: str) -> tuple[str, str]:
+    def _process_staff_scan(self, staff_code: str, when: datetime | None = None) -> tuple[str, str]:
+        when = when or self.local_now()
+        day = when.date().isoformat()
+        now_str = when.strftime("%H:%M:%S")
+
         staff = self.find_staff(staff_code)
         if staff is None:
             return "not_found", f"Scanned staff code {staff_code} not found."
 
         display_name = staff.get("first_name") or staff_code
-        existing = self.get_today_staff_attendance(staff["staff_id"])
+        existing = self.get_today_staff_attendance(staff["staff_id"], day)
         current_status = existing["attendance"] if existing else "Not Clocked In"
-        now_str = self.local_now().strftime("%H:%M:%S")
 
         if current_status == "Not Clocked In":
-            self.set_staff_attendance(staff["staff_id"], attendance="In", time_in=now_str)
+            self.set_staff_attendance(staff["staff_id"], day=day, attendance="In", time_in=now_str)
             return "checked_in", f"👔 Staff Clocked IN: {display_name}"
         elif current_status == "In":
-            self.set_staff_attendance(staff["staff_id"], attendance="Out", time_out=now_str)
+            self.set_staff_attendance(staff["staff_id"], day=day, attendance="Out", time_out=now_str)
             return "checked_out", f"👋 Staff Clocked OUT: {display_name}"
         else:
             return "already_done", f"ℹ️ {display_name} already logged as '{current_status}'"
