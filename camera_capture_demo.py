@@ -37,7 +37,7 @@ from googleapiclient.http import MediaIoBaseUpload
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]  # app can only touch files it created
 ROOT_NAME = "Student Book Photos"
-KEEP_COPIES = 3          # per student; make this a center setting later
+KEEP_COPIES = 1000          # per student; 
 CONFIRM_PHOTO = True     # toggle: preview + keep/retake before saving
 CAMERA_INDEX = 0
 PENDING_DIR = "pending_photos"

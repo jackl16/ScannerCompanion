@@ -43,6 +43,7 @@ LOCAL_TZ = ZoneInfo("America/Edmonton")  # match the Streamlit app's timezone
 TOKEN_REFRESH_INTERVAL_SECONDS = 30 * 60  # refresh well before Supabase's ~1hr token expiry
 
 STAFF_CODE_PATTERN = re.compile(r"^S\d{5}$")
+PHOTO_HIDDEN_STATUSES = {"withdrawn"}
 
 # Substrings that show up in exceptions caused by *connectivity* problems
 # (no internet, DNS hiccup, request timeout, etc.) as opposed to a genuine
@@ -121,6 +122,10 @@ class ScannerDB:
         self.baud_rate = scanner_cfg.get("baud_rate", 9600)
         self.debounce_seconds = scanner_cfg.get("debounce_seconds", 3)
         self.sound_enabled = scanner_cfg.get("sound_enabled", False)
+        
+        features_cfg = config.get("features", {})
+        self.photo_unlocked = bool(features_cfg.get("drive_photos", False))
+        self.photo_mode = self.photo_unlocked and bool(features_cfg.get("photo_mode", False))
 
         self._last_scan_id = None
         self._last_scan_time = 0
@@ -285,6 +290,19 @@ class ScannerDB:
         save_config(config)
         self.sound_enabled = enabled
 
+    # --- features ----
+    def unlock_photo_feature(self) -> None:
+        config = load_config()
+        config.setdefault("features", {})["drive_photos"] = True
+        save_config(config)
+        self.photo_unlocked = True
+
+    def save_photo_mode(self, enabled: bool) -> None:
+        config = load_config()
+        config.setdefault("features", {})["photo_mode"] = enabled
+        save_config(config)
+        self.photo_mode = enabled
+
     # --- local time helpers ---
 
     def local_now(self) -> datetime:
@@ -314,6 +332,40 @@ class ScannerDB:
                 return s
         return None
 
+    def find_student_fresh(self, code: str) -> dict | None:
+        student = self.find_student(code)
+        if student is None:
+            self._students_cache_time = 0
+            student = self.find_student(code)
+        return student
+
+    @staticmethod
+    def is_withdrawn(student: dict) -> bool:
+        status = str(student.get("enrollment_status") or "").strip().lower()
+        return status in PHOTO_HIDDEN_STATUSES
+
+    def search_students(self, query: str, limit: int = 50) -> list:
+        terms = query.lower().replace(",", " ").split()
+        if not terms:
+            return []
+
+        def run():
+            out = []
+            for s in self.get_students():
+                if self.is_withdrawn(s):
+                    continue
+                name = f"{s.get('first_name', '')} {s.get('last_name', '')}".lower()
+                if all(t in name for t in terms):
+                    out.append(s)
+            return out
+
+        results = run()
+        if not results:
+            self._students_cache_time = 0  # maybe a brand-new student: refresh once
+            results = run()
+        results.sort(key=lambda s: (str(s.get("last_name", "")).lower(),
+                                    str(s.get("first_name", "")).lower()))
+        return results[:limit]
     # --- attendance ---
 
     def get_today_attendance(self, s_id: int) -> dict | None:
