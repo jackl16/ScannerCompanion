@@ -871,7 +871,7 @@ class ScannerApp(tk.Tk):
             self.status_label.config(text=f"Student data problem: {e}", fg=COLORS["error"])
             return
 
-        label = f"{info['last']}, {info['first']}"
+        label = f"{info['first']}, {info['last']}"
         subjects = list(info["subjects"])
         if not subjects:
             self._play_feedback_sound(is_success=False)
@@ -961,7 +961,7 @@ class ScannerApp(tk.Tk):
         lb.pack(padx=12, pady=4)
         for s in matches:
             grade = f"   Gr {s['grade']}" if s.get("grade") else ""
-            lb.insert(tk.END, f"{s.get('last_name', '')}, {s.get('first_name', '')}  "
+            lb.insert(tk.END, f"{s.get('first_name', '')}, {s.get('last_name', '')}  "
                               f"({s.get('barcode_code', '')}){grade}")
         lb.selection_set(0)
         lb.focus_set()

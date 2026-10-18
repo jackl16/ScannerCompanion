@@ -383,8 +383,8 @@ class ScannerDB:
         if not results:
             self._students_cache_time = 0  # maybe a brand-new student: refresh once
             results = run()
-        results.sort(key=lambda s: (str(s.get("last_name", "")).lower(),
-                                    str(s.get("first_name", "")).lower()))
+        results.sort(key=lambda s: (str(s.get("first_name", "")).lower(),
+                                    str(s.get("last_name", "")).lower()))
         return results[:limit]
     # --- attendance ---
 

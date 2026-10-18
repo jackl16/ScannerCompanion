@@ -95,10 +95,10 @@ class DriveStore:
         return fid
 
     def upload(self, student_id, last, first, subject, jpeg, barcode=None):
-        """Saves to <root>/<Last, First (ID)>/<subject>/ and keeps only the newest N photos per subject."""
+        """Saves to <root>/<First, Last (ID)>/<subject>/ and keeps only the newest N photos per subject."""
         try:
             label = student_id
-            student = self._find_or_create(f"student:{student_id}", f"{last}, {first} ({label})", self.root_id)
+            student = self._find_or_create(f"student:{student_id}", f"{first}, {last} ({label})", self.root_id)
             folder = self._find_or_create(f"student:{student_id}:{subject}", subject, student)
             name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".jpg"
             media = MediaIoBaseUpload(io.BytesIO(jpeg), mimetype="image/jpeg")
