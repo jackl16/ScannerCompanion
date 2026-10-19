@@ -32,7 +32,7 @@ from pathlib import Path
 import customtkinter as ctk
 from ui_kit import (COLORS, FONT, MONO, font, TopBar, StatusText,
                     LastScanCard, ScanLog, StatusPanel, ActionButton, MenuPanel,
-                    messagebox,simpledialog)
+                    messagebox,simpledialog, ListPicker)
 
 try:
     import winsound
@@ -287,10 +287,13 @@ class ScannerApp(ctk.CTk):
             lightcolor=COLORS["border"], darkcolor=COLORS["border"],
         )
 
+        scale = max(self.winfo_fpixels("1i") / 96, 1.0)
         style.configure("Treeview", background=COLORS["card"], fieldbackground=COLORS["card"],
-                        foreground=COLORS["text"], borderwidth=0, rowheight=24)
+                        foreground=COLORS["text"], borderwidth=0, relief="flat",
+                        rowheight=int(32 * scale), font=(FONT, 11))
         style.map("Treeview", background=[("selected", COLORS["primary"])],
                   foreground=[("selected", COLORS["on_primary"])])
+        style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])  # no border
 
     def _make_menu(self):
         return MenuPanel(self)
@@ -760,7 +763,7 @@ class ScannerApp(ctk.CTk):
             self.mode_label.config(text="📷 PHOTO MODE (no check-in)", fg=COLORS["warning"])
             self.hero.pack_forget()
             self._ensure_photo_widgets()
-            self.photo_search_frame.pack(fill="x", before=self.log_frame)
+            self.photo_search_frame.pack(fill="x", padx=20, pady=(12, 0), before=self.log_frame)
             self.photo_browser.pack(fill="both", expand=True, padx=20, pady=(8, 0), before=self.log_frame)
             self.log_frame.pack(fill="both", expand=False, padx=20, pady=(8, 12))
             self.log_list.configure(height=130)
@@ -922,26 +925,30 @@ class ScannerApp(ctk.CTk):
         next_subject()
 
     def _build_photo_search_bar(self):
-        """Created on every scanner screen build, but only shown while photo mode is on."""
-        self.photo_search_frame = ttk.Frame(self, padding=(20, 12, 20, 0))
-        ttk.Label(self.photo_search_frame, text="Type a barcode or student name, then press Enter:",
-                  style="Muted.TLabel").pack(anchor="w")
-        row = ttk.Frame(self.photo_search_frame)
-        row.pack(fill="x", pady=(4, 0))
-        self.photo_search_var = tk.StringVar()
-        self.photo_search_entry = ttk.Entry(row, textvariable=self.photo_search_var, style="DarkEntry.TEntry")
+        """Created when photo mode first turns on; only shown while it's on."""
+        self.photo_search_frame = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=12,
+                                               border_width=1, border_color=COLORS["border"])
+        inner = ctk.CTkFrame(self.photo_search_frame, fg_color="transparent")
+        inner.pack(fill="x", padx=12, pady=10)
+        self.photo_search_entry = ctk.CTkEntry(
+            inner, height=40, corner_radius=10, font=font(13),
+            placeholder_text="Search by name, or type a barcode, then press Enter",
+            fg_color=COLORS["bg"], border_color=COLORS["border"])
         self.photo_search_entry.pack(side="left", fill="x", expand=True)
         self.photo_search_entry.bind("<Return>", self._on_photo_search)
-        ttk.Button(row, text="Find", command=self._on_photo_search).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(inner, text="Find", width=84, height=40, corner_radius=10,
+                      font=font(13, "bold"), fg_color=COLORS["primary"],
+                      hover_color=COLORS["primary_dark"],
+                      command=self._on_photo_search).pack(side="left", padx=(10, 0))
 
     def _on_photo_search(self, event=None):
-        query = self.photo_search_var.get().strip()
+        query = self.photo_search_entry.get().strip()
         if not query:
             return
         if self._photo_busy:
             self.status_label.config(text="Finish the current photo first.", fg=COLORS["warning"])
             return
-        self.photo_search_var.set("")
+        self.photo_search_entry.delete(0, "end")
 
         if query.isdigit():
             self._handle_photo_scan(query)  # typed barcode: same path as a scan
@@ -961,35 +968,15 @@ class ScannerApp(ctk.CTk):
             self._show_student_picker(matches)
 
     def _show_student_picker(self, matches: list):
-        win = tk.Toplevel(self)
-        win.title("Choose a student")
-        win.configure(bg=COLORS["bg"])
-        win.transient(self)
-        ttk.Label(win, text="Multiple matches - pick one:", style="Muted.TLabel").pack(
-            anchor="w", padx=12, pady=(12, 4))
-
-        lb = tk.Listbox(win, width=48, height=min(12, len(matches)))
-        self._style_listbox(lb)
-        lb.pack(padx=12, pady=4)
+        items = []
         for s in matches:
-            grade = f"   Gr {s['grade']}" if s.get("grade") else ""
-            lb.insert(tk.END, f"{s.get('first_name', '')}, {s.get('last_name', '')}  "
-                              f"({s.get('barcode_code', '')}){grade}")
-        lb.selection_set(0)
-        lb.focus_set()
-
-        def choose(event=None):
-            sel = lb.curselection()
-            if not sel:
-                return
-            student = matches[sel[0]]
-            win.destroy()
-            self._start_photo_for_student(student)
-
-        lb.bind("<Double-Button-1>", choose)
-        lb.bind("<Return>", choose)
-        win.bind("<Escape>", lambda e: win.destroy())
-        ttk.Button(win, text="Select", command=choose).pack(pady=(4, 12))
+            name = f"{s.get('first_name', '')} {s.get('last_name', '')}".strip()
+            bits = [f"Barcode {s.get('barcode_code', '')}"]
+            if s.get("grade"):
+                bits.append(f"Grade {s['grade']}")
+            items.append((name, "   •   ".join(bits)))
+        ListPicker(self, "Choose a student", f"{len(matches)} matches. Pick one:", items,
+                   lambda i: self._start_photo_for_student(matches[i]))
 
     def _finish_photo_uploads(self, max_wait=20):
         """Gives queued uploads a few seconds to finish before the app closes or updates."""

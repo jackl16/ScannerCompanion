@@ -378,7 +378,7 @@ class _Dialog(ctk.CTkToplevel):
         self.title(title)
         self.resizable(False, False)
         self._cancel_value = cancel_value
-        self._default = buttons[-1][1]
+        self._default = next(v for _, v, s in buttons if s == "primary")  # Enter = the primary button
         self._entry = None
         self.result = cancel_value
 
@@ -477,15 +477,77 @@ class _MessageBox:
     @staticmethod
     def askyesno(title, message, parent=None, **_):
         return bool(_ask(parent, title, message, "question",
-                         [("No", False, "secondary"), ("Yes", True, "primary")], False))
+                         [("Yes", True, "primary"), ("No", False, "secondary")], False))
 
 
 class _SimpleDialog:
     @staticmethod
     def askstring(title, prompt, parent=None, show=None, **_):
         return _ask(parent, title, prompt, "question",
-                    [("Cancel", None, "secondary"), ("OK", True, "primary")], None,
+                    [("OK", True, "primary"), ("Cancel", None, "secondary")], None,
                     entry=True, secret=bool(show))
+
+def center_over(win, parent):
+    """Size a window to its content and centre it over its parent (raw Tk call: real pixels)."""
+    win.update_idletasks()
+    w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+    if parent.winfo_ismapped():
+        x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+    else:
+        x = (win.winfo_screenwidth() - w) // 2
+        y = (win.winfo_screenheight() - h) // 2
+    win.wm_geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+
+
+class ListPicker(ctk.CTkToplevel):
+    """Dark picker window: a scrollable list of two-line choices."""
+
+    def __init__(self, parent, title, subtitle, items, on_pick):
+        super().__init__(parent)
+        self.withdraw()
+        self.configure(fg_color=COLORS["bg"])
+        self.title(title)
+        self.resizable(False, False)
+        self._parent, self._on_pick = parent, on_pick
+
+        card = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=14,
+                            border_width=1, border_color=COLORS["border"])
+        card.pack(fill="both", expand=True, padx=12, pady=12)
+        ctk.CTkLabel(card, text=title, font=font(16, "bold"), anchor="w",
+                     text_color=COLORS["text"]).pack(fill="x", padx=20, pady=(18, 0))
+        ctk.CTkLabel(card, text=subtitle, font=font(12), anchor="w",
+                     text_color=COLORS["text_muted"]).pack(fill="x", padx=20, pady=(0, 10))
+
+        scroll = ctk.CTkScrollableFrame(card, fg_color="transparent", width=380,
+                                        height=min(340, 62 * len(items) + 8))
+        scroll.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        for i, (name, sub) in enumerate(items):
+            ctk.CTkButton(scroll, text=f"{name}\n{sub}", anchor="w", height=54, corner_radius=10,
+                          fg_color=COLORS["card_alt"], hover_color=COLORS["border"],
+                          text_color=COLORS["text"], font=font(13),
+                          command=lambda i=i: self._choose(i)).pack(fill="x", pady=3)
+        ctk.CTkButton(card, text="Cancel", height=36, corner_radius=10, font=font(13),
+                      fg_color="transparent", hover_color=COLORS["card_alt"],
+                      text_color=COLORS["text_muted"], command=self.destroy
+                      ).pack(fill="x", padx=20, pady=(4, 16))
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        center_over(self, parent)
+        self.transient(parent)
+        self.deiconify()
+        self.after(100, self._activate)
+
+    def _activate(self):
+        try:
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+
+    def _choose(self, i):
+        self.destroy()
+        self._parent.after(60, lambda: self._on_pick(i))  # let this window close first
 
 
 messagebox = _MessageBox()

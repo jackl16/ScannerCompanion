@@ -28,6 +28,8 @@ from tkinter import ttk
 from ui_kit import messagebox
 
 from scanner_db import BASE_DIR as BASE
+import customtkinter as ctk
+from ui_kit import COLORS, FONT, font, StatusText, center_over
 
 import cv2
 from PIL import Image, ImageTk
@@ -152,22 +154,21 @@ def _jpeg(frame):
     return buf.tobytes()
 
 
-class PhotoDialog(tk.Toplevel):
-    """Live camera preview inside Tk. Calls on_done(jpeg_bytes or None) when finished.
+class PhotoDialog(ctk.CTkToplevel):
+    """Live camera preview. Calls on_done(jpeg_bytes or None) when finished.
     Keys: Space = capture, Enter = keep, R = retake, Esc = cancel."""
 
     PREVIEW_W = 640  # raise to ~800 for a bigger preview if the screen allows
 
     def __init__(self, parent, label, on_done, confirm=CONFIRM_PHOTO, subtitle="", theme=None):
         super().__init__(parent)
-        theme = theme or DEFAULT_THEME
-        self.c, self.font = theme["colors"], theme["font"]
+        self.withdraw()
+        self.configure(fg_color=COLORS["bg"])
         self.title("Take Photo")
-        self.configure(bg=self.c["bg"])
         self.resizable(False, False)
-        self.transient(parent)
         self.on_done, self.confirm = on_done, confirm
-        self.frame, self.frozen, self.closed = None, False, False
+        self.shot, self.frozen, self.closed = None, False, False
+        self._tick_job = self._act_job = None
 
         self.cam = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)  # CAP_DSHOW opens faster on Windows
         if not self.cam.isOpened():
@@ -175,40 +176,54 @@ class PhotoDialog(tk.Toplevel):
             self.finish(None)
             return
 
-        # header banner: student name, then subject / step
-        head = tk.Frame(self, bg=self.c["primary"], padx=16, pady=10)
-        head.pack(fill="x")
-        tk.Label(head, text=label, font=(self.font, 16, "bold"), anchor="w",
-                 bg=self.c["primary"], fg=self.c["on_primary"]).pack(fill="x")
-        if subtitle:
-            tk.Label(head, text=subtitle, font=(self.font, 10), anchor="w",
-                     bg=self.c["primary"], fg=self.c.get("primary_light", "#DBEAFE")).pack(fill="x")
+        card = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=16,
+                            border_width=1, border_color=COLORS["border"])
+        card.pack(fill="both", expand=True, padx=12, pady=12)
 
-        self.state_label = tk.Label(self, font=(self.font, 10, "bold"), bg=self.c["bg"])
-        self.state_label.pack(pady=(10, 4))
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.pack(fill="x", padx=20, pady=(16, 10))
+        names = ctk.CTkFrame(head, fg_color="transparent")
+        names.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(names, text=label, font=font(20, "bold"), anchor="w",
+                     text_color=COLORS["text"]).pack(fill="x")
+        if subtitle:
+            ctk.CTkLabel(names, text=subtitle, font=font(12), anchor="w",
+                         text_color=COLORS["text_muted"]).pack(fill="x")
+        self.state_label = ctk.CTkLabel(head, text="", width=100, height=28, corner_radius=14,
+                                        font=font(11, "bold"))
+        self.state_label.pack(side="right")
 
         # coloured frame around the preview (green = live, amber = reviewing)
-        self.box = tk.Frame(self, bg=self.c["success"], padx=3, pady=3)
-        self.box.pack(padx=16)
+        self.box = ctk.CTkFrame(card, fg_color=COLORS["bg"], corner_radius=12,
+                                border_width=3, border_color=COLORS["success"])
+        self.box.pack(padx=20)
         cam_w = int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
         cam_h = int(self.cam.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
         self._blank = tk.PhotoImage(width=self.PREVIEW_W, height=int(cam_h * self.PREVIEW_W / cam_w))
-        self.view = tk.Label(self.box, image=self._blank, bg=self.c["card"], bd=0)
-        self.view.pack()
+        self.view = tk.Label(self.box, image=self._blank, bg=COLORS["bg"], bd=0)
+        self.view.pack(padx=6, pady=6)
 
-        self.bar = tk.Frame(self, bg=self.c["bg"])
-        self.bar.pack(pady=(12, 4))
-        mk = lambda text, cmd, style="TButton": ttk.Button(
-            self.bar, text=text, width=16, command=cmd, style=style, takefocus=0)
+        self.bar = ctk.CTkFrame(card, fg_color="transparent")
+        self.bar.pack(pady=(16, 6))
+
+        def btn(text, cmd, kind):
+            fg, hover, tc = {
+                "primary": (COLORS["primary"], COLORS["primary_dark"], COLORS["on_primary"]),
+                "success": (COLORS["success"], "#16a34a", "#ffffff"),
+                "secondary": (COLORS["card_alt"], COLORS["border"], COLORS["text"]),
+            }[kind]
+            return ctk.CTkButton(self.bar, text=text, command=cmd, width=150, height=44,
+                                 corner_radius=12, fg_color=fg, hover_color=hover, text_color=tc,
+                                 font=font(14, "normal" if kind == "secondary" else "bold"))
+
         self.buttons = {
-            "capture": mk("Capture (Space)", self.capture),
-            "keep": mk("Keep (Enter)", self.keep),
-            "retake": mk("Retake (R)", self.retake, "Secondary.TButton"),
-            "cancel": mk("Cancel (Esc)", lambda: self.finish(None), "Secondary.TButton"),
+            "capture": btn("Capture", self.capture, "primary"),
+            "keep": btn("Keep", self.keep, "success"),
+            "retake": btn("Retake", self.retake, "secondary"),
+            "cancel": btn("Cancel", lambda: self.finish(None), "secondary"),
         }
-
-        self.hint = tk.Label(self, font=(self.font, 9), bg=self.c["bg"], fg=self.c["text_muted"])
-        self.hint.pack(pady=(0, 12))
+        self.hint = ctk.CTkLabel(card, text="", font=font(11), text_color=COLORS["text_muted"])
+        self.hint.pack(pady=(0, 16))
         self._set_mode(reviewing=False)
 
         self.bind("<space>", lambda e: self.capture())
@@ -217,31 +232,38 @@ class PhotoDialog(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.finish(None))
         self.protocol("WM_DELETE_WINDOW", lambda: self.finish(None))
 
-        # centre over the main window
-        self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_reqwidth()) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_reqheight()) // 2
-        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-
-        self.focus_force()
+        center_over(self, parent)
+        self.transient(parent)
+        self.deiconify()
+        self._act_job = self.after(100, self._activate)
         self._tick()
+
+    def _activate(self):
+        self._act_job = None
+        if self.closed:
+            return
+        try:
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
 
     def _layout(self, names):
         for b in self.buttons.values():
             b.pack_forget()
         for n in names:
-            self.buttons[n].pack(side="left", padx=4)
+            self.buttons[n].pack(side="left", padx=5)
 
     def _set_mode(self, reviewing):
         if reviewing:
-            self.box.configure(bg=self.c["warning"])
-            self.state_label.config(text="Review - keep this photo?", fg=self.c["warning"])
-            self.hint.config(text="Enter = keep     R = retake     Esc = cancel")
+            self.box.configure(border_color=COLORS["warning"])
+            self.state_label.configure(text="REVIEW", fg_color=COLORS["warning"], text_color="#1c1203")
+            self.hint.configure(text="Enter = keep      R = retake      Esc = cancel")
             self._layout(["keep", "retake", "cancel"])
         else:
-            self.box.configure(bg=self.c["success"])
-            self.state_label.config(text="●  Live preview", fg=self.c["success"])
-            self.hint.config(text="Space = capture     Esc = cancel")
+            self.box.configure(border_color=COLORS["success"])
+            self.state_label.configure(text="●  LIVE", fg_color=COLORS["success"], text_color="#052e16")
+            self.hint.configure(text="Space = capture      Esc = cancel")
             self._layout(["capture", "cancel"])
 
     def _tick(self):
@@ -250,24 +272,24 @@ class PhotoDialog(tk.Toplevel):
         if not self.frozen:
             ok, frame = self.cam.read()
             if ok:
-                self.frame = frame
+                self.shot = frame
                 small = cv2.resize(frame, (self.PREVIEW_W, int(frame.shape[0] * self.PREVIEW_W / frame.shape[1])))
-                self.photo = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
-                self.view.configure(image=self.photo)  # keep a reference or Tk drops the image
-        self.after(30, self._tick)
+                self._photo_img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
+                self.view.configure(image=self._photo_img)  # keep a reference or Tk drops the image
+        self._tick_job = self.after(30, self._tick)
 
     def capture(self):
-        if self.frame is None or self.frozen:
+        if self.shot is None or self.frozen:
             return
         if not self.confirm:
-            self.finish(_jpeg(self.frame))
+            self.finish(_jpeg(self.shot))
         else:
             self.frozen = True  # freeze the preview so the user can check the shot
             self._set_mode(reviewing=True)
 
     def keep(self):
         if self.frozen:
-            self.finish(_jpeg(self.frame))
+            self.finish(_jpeg(self.shot))
 
     def retake(self):
         if self.frozen:
@@ -278,6 +300,12 @@ class PhotoDialog(tk.Toplevel):
         if self.closed:
             return
         self.closed = True
+        for job in (self._tick_job, self._act_job):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
         self.cam.release()
         self.destroy()
         self.on_done(result)
@@ -352,19 +380,20 @@ def _open_external(path):
         subprocess.run(["xdg-open", path])
 
 
-class PhotoBrowser(ttk.Frame):
+class PhotoBrowser(ctk.CTkFrame):
     """Lazy Drive browser: students -> subject folders -> photos.
     One API call per folder expanded and per photo opened. All Drive work runs on
     background threads and reports back through a queue polled on the Tk thread."""
 
     def __init__(self, parent, get_store, get_visible_students):
-        super().__init__(parent)
+        super().__init__(parent, fg_color="transparent")
         self.get_store = get_store                          # -> DriveStore or None
         self.get_visible_students = get_visible_students    # -> {s_id: "First Last (barcode)"}
-        self.meta = {}                  # tree item id -> {"kind", "id", "name"}
+        self.meta = {}                  # tree item id -> {"kind", "id", ...}
         self._q = queue.Queue()
         self._cache = OrderedDict()     # photo file id -> bytes (last 30)
         self._want = None               # photo currently selected for preview
+        self._selected = None
         self._loading = set()
         self._job = None
         self._img = None
@@ -372,25 +401,56 @@ class PhotoBrowser(ttk.Frame):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(self)
+        # left card: folder tree
+        left = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=12,
+                            border_width=1, border_color=COLORS["border"])
         left.grid(row=0, column=0, sticky="ns", padx=(0, 10))
-        bar = ttk.Frame(left)
-        bar.pack(fill="x")
-        ttk.Button(bar, text="Refresh", command=self.refresh).pack(side="left")
-        self.status = ttk.Label(bar, text="Click Refresh to load", style="Muted.TLabel")
-        self.status.pack(side="left", padx=8)
+        bar = ctk.CTkFrame(left, fg_color="transparent")
+        bar.pack(fill="x", padx=12, pady=(12, 0))
+        ctk.CTkLabel(bar, text="STUDENT PHOTOS", font=font(11, "bold"),
+                     text_color=COLORS["text_muted"]).pack(side="left")
+        ctk.CTkButton(bar, text="Refresh", width=76, height=28, corner_radius=8, font=font(12),
+                      fg_color=COLORS["card_alt"], hover_color=COLORS["border"],
+                      text_color=COLORS["text"], command=self.refresh).pack(side="right")
+        tk.Frame(left, height=1, bg="#3f3f46").pack(fill="x", padx=12, pady=(10, 0))  # divider
 
-        box = ttk.Frame(left)
-        box.pack(fill="both", expand=True, pady=(6, 0))
+        # footer status line: always present, so changing its text never moves anything.
+        # Packed from the bottom up: status first (lowest), then its divider, then the tree.
+        self.status = StatusText(left, text="Click Refresh to load", size=11, anchor="w",
+                                 wraplength=290)
+        self.status.pack(side="bottom", fill="x", padx=14, pady=(4, 10))
+        tk.Frame(left, height=1, bg="#3f3f46").pack(side="bottom", fill="x", padx=12)
+
+        box = tk.Frame(left, bg=COLORS["card"])  # plain frame hosts the ttk tree + scrollbar
+        box.pack(fill="both", expand=True, padx=(8, 4), pady=(6, 4))
         self.tree = ttk.Treeview(box, show="tree", selectmode="browse")
-        self.tree.column("#0", width=280, stretch=True)
-        sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        self.tree.column("#0", width=290, stretch=True)
+        sb = ctk.CTkScrollbar(box, command=self.tree.yview, width=12, fg_color=COLORS["card"],
+                              button_color=COLORS["border"], button_hover_color=COLORS["text_muted"])
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        sb.pack(side="right", fill="y", padx=(2, 4))
 
-        self.preview = ttk.Label(self, text="Select a photo", style="Muted.TLabel", anchor="center")
-        self.preview.grid(row=0, column=1, sticky="nsew")
+        # right card: preview
+        right = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=12,
+                             border_width=1, border_color=COLORS["border"])
+        right.grid(row=0, column=1, sticky="nsew")
+        self.caption = ctk.CTkLabel(right, text="", font=font(13, "bold"), anchor="w",
+                                    text_color=COLORS["text"])
+        self.caption.pack(fill="x", padx=16, pady=(14, 0))
+        self.preview_box = ctk.CTkFrame(right, width=300, height=260, fg_color=COLORS["bg"],
+                                        corner_radius=10, border_width=1, border_color="#3f3f46")
+        self.preview_box.pack_propagate(False)  # the photo can't resize its own box
+        self.preview_box.pack(fill="both", expand=True, padx=14, pady=10)
+        self.preview = tk.Label(self.preview_box, text="Select a photo to preview it here",
+                                bg=COLORS["bg"], fg=COLORS["text_muted"], font=(FONT, 12))
+        self.preview.pack(fill="both", expand=True, padx=6, pady=6)
+        self.open_btn = ctk.CTkButton(right, text="Open full size", height=34, corner_radius=8,
+                                      font=font(12), fg_color=COLORS["card_alt"],
+                                      hover_color=COLORS["border"], text_color=COLORS["text"],
+                                      text_color_disabled=COLORS["text_muted"],
+                                      state="disabled", command=self._open_selected)
+        self.open_btn.pack(anchor="e", padx=14, pady=(0, 12))
 
         self.tree.bind("<<TreeviewOpen>>", self._on_open)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
@@ -473,8 +533,20 @@ class PhotoBrowser(ttk.Frame):
     def _on_select(self, event):
         sel = self.tree.selection()
         meta = self.meta.get(sel[0]) if sel else None
-        if meta and meta["kind"] == "photo":
-            self._show_photo(meta["id"], external=False)
+        if not (meta and meta["kind"] == "photo"):
+            return
+        subject_iid = self.tree.parent(sel[0])
+        student_iid = self.tree.parent(subject_iid)
+        self.caption.configure(text=f"{self.tree.item(student_iid, 'text')}   •   "
+                                    f"{self.tree.item(subject_iid, 'text')}   •   "
+                                    f"{self.tree.item(sel[0], 'text')}")
+        self._selected = meta["id"]
+        self.open_btn.configure(state="normal")
+        self._show_photo(meta["id"], external=False)
+
+    def _open_selected(self):
+        if self._selected:
+            self._show_photo(self._selected, external=True)
 
     def _on_double_click(self, event):
         meta = self.meta.get(self.tree.identify_row(event.y))
@@ -544,8 +616,8 @@ class PhotoBrowser(ttk.Frame):
             _open_external(path)
         elif fid == self._want:
             img = Image.open(io.BytesIO(data))
-            img.thumbnail((max(self.preview.winfo_width() - 10, 200),
-                           max(self.preview.winfo_height() - 10, 200)))
+            img.thumbnail((max(self.preview_box.winfo_width() - 20, 200),
+                           max(self.preview_box.winfo_height() - 20, 200)))
             self._img = ImageTk.PhotoImage(img)  # keep a reference or Tk drops it
             self.preview.config(image=self._img, text="")
 
