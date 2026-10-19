@@ -1,4 +1,4 @@
-name: Build Mac app
+name: Build and Run Mac app
 on:
   workflow_dispatch:
 
@@ -49,8 +49,23 @@ jobs:
       - name: Diagnostic Run Check
         run: |
           echo "Simulating system launch to check for runtime library crashes..."
-          # This verifies that the app binary can execute without exiting instantly
-          timeout 5 "dist/ScannerCompanion.app/Contents/MacOS/ScannerCompanion" || true
+          
+          # Start the app in the background so it doesn't block the terminal
+          "dist/ScannerCompanion.app/Contents/MacOS/ScannerCompanion" &
+          APP_PID=$!
+          
+          # Give it 5 seconds to load dependencies, verify the config, and initialize
+          sleep 5
+          
+          # Check if the process crashed during boot or if it's still alive
+          if kill -0 $APP_PID 2>/dev/null; then
+            echo "SUCCESS: The app launched perfectly and is running smoothly!"
+            kill $APP_PID # Safely close it down now that we verified it works
+          else
+            echo "ERROR: The application crashed silently immediately after launching!"
+            exit 1 # Fail the build so you can review any python traceback errors above
+          fi
+
 
       - name: Package Release
         run: |
