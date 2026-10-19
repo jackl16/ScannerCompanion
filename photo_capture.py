@@ -37,6 +37,13 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
+DEFAULT_THEME = {
+    "colors": {"bg": "#121214", "card": "#1a1a1e", "border": "#27272a", "text": "#f4f4f5",
+               "text_muted": "#a1a1aa", "primary": "#4f46e5", "primary_light": "#DBEAFE",
+               "on_primary": "#FFFFFF", "success": "#10b981", "warning": "#f59e0b"},
+    "font": "Segoe UI",
+}
+
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]  # app can only touch files it created
 ROOT_NAME = "Student Book Photos"
 KEEP_COPIES = 1000          # per student; 
@@ -148,36 +155,73 @@ class PhotoDialog(tk.Toplevel):
     """Live camera preview inside Tk. Calls on_done(jpeg_bytes or None) when finished.
     Keys: Space = capture, Enter = keep, R = retake, Esc = cancel."""
 
-    def __init__(self, parent, label, on_done, confirm=CONFIRM_PHOTO):
+    PREVIEW_W = 640  # raise to ~800 for a bigger preview if the screen allows
+
+    def __init__(self, parent, label, on_done, confirm=CONFIRM_PHOTO, subtitle="", theme=None):
         super().__init__(parent)
-        self.title("Photo")
+        theme = theme or DEFAULT_THEME
+        self.c, self.font = theme["colors"], theme["font"]
+        self.title("Take Photo")
+        self.configure(bg=self.c["bg"])
+        self.resizable(False, False)
+        self.transient(parent)
         self.on_done, self.confirm = on_done, confirm
         self.frame, self.frozen, self.closed = None, False, False
+
         self.cam = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)  # CAP_DSHOW opens faster on Windows
         if not self.cam.isOpened():
             messagebox.showerror("Camera", "Camera not found", parent=parent)
             self.finish(None)
             return
 
-        tk.Label(self, text=label, font=("Segoe UI", 14, "bold")).pack(pady=4)
-        self.view = tk.Label(self)
-        self.view.pack(padx=8)
-        self.bar = tk.Frame(self)
-        self.bar.pack(pady=8)
-        mk = lambda text, cmd: tk.Button(self.bar, text=text, width=16, command=cmd, takefocus=0)
+        # header banner: student name, then subject / step
+        head = tk.Frame(self, bg=self.c["primary"], padx=16, pady=10)
+        head.pack(fill="x")
+        tk.Label(head, text=label, font=(self.font, 16, "bold"), anchor="w",
+                 bg=self.c["primary"], fg=self.c["on_primary"]).pack(fill="x")
+        if subtitle:
+            tk.Label(head, text=subtitle, font=(self.font, 10), anchor="w",
+                     bg=self.c["primary"], fg=self.c.get("primary_light", "#DBEAFE")).pack(fill="x")
+
+        self.state_label = tk.Label(self, font=(self.font, 10, "bold"), bg=self.c["bg"])
+        self.state_label.pack(pady=(10, 4))
+
+        # coloured frame around the preview (green = live, amber = reviewing)
+        self.box = tk.Frame(self, bg=self.c["success"], padx=3, pady=3)
+        self.box.pack(padx=16)
+        cam_w = int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+        cam_h = int(self.cam.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+        self._blank = tk.PhotoImage(width=self.PREVIEW_W, height=int(cam_h * self.PREVIEW_W / cam_w))
+        self.view = tk.Label(self.box, image=self._blank, bg=self.c["card"], bd=0)
+        self.view.pack()
+
+        self.bar = tk.Frame(self, bg=self.c["bg"])
+        self.bar.pack(pady=(12, 4))
+        mk = lambda text, cmd, style="TButton": ttk.Button(
+            self.bar, text=text, width=16, command=cmd, style=style, takefocus=0)
         self.buttons = {
             "capture": mk("Capture (Space)", self.capture),
             "keep": mk("Keep (Enter)", self.keep),
-            "retake": mk("Retake (R)", self.retake),
-            "cancel": mk("Cancel (Esc)", lambda: self.finish(None)),
+            "retake": mk("Retake (R)", self.retake, "Secondary.TButton"),
+            "cancel": mk("Cancel (Esc)", lambda: self.finish(None), "Secondary.TButton"),
         }
-        self._layout(["capture", "cancel"])
+
+        self.hint = tk.Label(self, font=(self.font, 9), bg=self.c["bg"], fg=self.c["text_muted"])
+        self.hint.pack(pady=(0, 12))
+        self._set_mode(reviewing=False)
 
         self.bind("<space>", lambda e: self.capture())
         self.bind("<Return>", lambda e: self.keep())
         self.bind("<r>", lambda e: self.retake())
         self.bind("<Escape>", lambda e: self.finish(None))
         self.protocol("WM_DELETE_WINDOW", lambda: self.finish(None))
+
+        # centre over the main window
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_reqwidth()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_reqheight()) // 2
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
         self.focus_force()
         self._tick()
 
@@ -187,6 +231,18 @@ class PhotoDialog(tk.Toplevel):
         for n in names:
             self.buttons[n].pack(side="left", padx=4)
 
+    def _set_mode(self, reviewing):
+        if reviewing:
+            self.box.configure(bg=self.c["warning"])
+            self.state_label.config(text="Review - keep this photo?", fg=self.c["warning"])
+            self.hint.config(text="Enter = keep     R = retake     Esc = cancel")
+            self._layout(["keep", "retake", "cancel"])
+        else:
+            self.box.configure(bg=self.c["success"])
+            self.state_label.config(text="●  Live preview", fg=self.c["success"])
+            self.hint.config(text="Space = capture     Esc = cancel")
+            self._layout(["capture", "cancel"])
+
     def _tick(self):
         if self.closed:
             return
@@ -194,7 +250,7 @@ class PhotoDialog(tk.Toplevel):
             ok, frame = self.cam.read()
             if ok:
                 self.frame = frame
-                small = cv2.resize(frame, (640, int(frame.shape[0] * 640 / frame.shape[1])))
+                small = cv2.resize(frame, (self.PREVIEW_W, int(frame.shape[0] * self.PREVIEW_W / frame.shape[1])))
                 self.photo = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
                 self.view.configure(image=self.photo)  # keep a reference or Tk drops the image
         self.after(30, self._tick)
@@ -206,7 +262,7 @@ class PhotoDialog(tk.Toplevel):
             self.finish(_jpeg(self.frame))
         else:
             self.frozen = True  # freeze the preview so the user can check the shot
-            self._layout(["keep", "retake", "cancel"])
+            self._set_mode(reviewing=True)
 
     def keep(self):
         if self.frozen:
@@ -215,7 +271,7 @@ class PhotoDialog(tk.Toplevel):
     def retake(self):
         if self.frozen:
             self.frozen = False
-            self._layout(["capture", "cancel"])
+            self._set_mode(reviewing=False)
 
     def finish(self, result):
         if self.closed:
@@ -229,9 +285,10 @@ class PhotoDialog(tk.Toplevel):
 class UploadWorker(threading.Thread):
     """Uploads in the background so a slow connection never blocks the next scan."""
 
-    def __init__(self, store):
+    def __init__(self, store, on_uploaded=None):
         super().__init__(daemon=True)
         self.store = store
+        self.on_uploaded = on_uploaded
         self.q = queue.Queue()
         self.start()
 
@@ -245,6 +302,11 @@ class UploadWorker(threading.Thread):
                 try:
                     self.store.upload(*job)
                     print(f"uploaded {job[3]} photo for {job[0]}")
+                    if self.on_uploaded:
+                        try:
+                            self.on_uploaded(job[0], job[3])  # student id, subject
+                        except Exception:
+                            pass
                     break
                 except Exception as e:
                     print(f"upload failed ({e}); retry {attempt + 1}/3")
@@ -384,7 +446,7 @@ class PhotoBrowser(ttk.Frame):
         for f in store.list_children(store.root_id, folders_only=True):
             key = (f.get("appProperties") or {}).get("kt_key", "").split(":")
             if len(key) == 2 and key[0] == "student" and key[1] in visible:
-                rows.append((visible[key[1]], f["id"]))
+                rows.append((visible[key[1]], f["id"], key[1]))
         rows.sort(key=lambda r: r[0].lower())
         return ("root", rows)
 
@@ -439,9 +501,9 @@ class PhotoBrowser(ttk.Frame):
     def _handle(self, msg):
         kind = msg[0]
         if kind == "root":
-            for label, fid in msg[1]:
+            for label, fid, sid in msg[1]:
                 iid = self.tree.insert("", "end", text=label)
-                self.meta[iid] = {"kind": "student", "id": fid}
+                self.meta[iid] = {"kind": "student", "id": fid, "student_id": sid}
                 self.tree.insert(iid, "end", text="Loading...")
             self.status.config(text=f"{len(msg[1])} students with photos")
         elif kind == "children":
@@ -485,6 +547,33 @@ class PhotoBrowser(ttk.Frame):
                            max(self.preview.winfo_height() - 10, 200)))
             self._img = ImageTk.PhotoImage(img)  # keep a reference or Tk drops it
             self.preview.config(image=self._img, text="")
+
+    def _is_open(self, iid):
+        return str(self.tree.item(iid, "open")).lower() in ("1", "true")
+
+    def on_uploaded(self, student_id, subject):
+        """A photo finished uploading: refresh only the folder the user could be looking at."""
+        student_iid = next((i for i, m in self.meta.items()
+                            if m["kind"] == "student" and m.get("student_id") == str(student_id)), None)
+        if student_iid is None:
+            if self.tree.get_children():  # list is loaded and this student's folder is brand new
+                self.refresh()
+            return
+        if not self._is_open(student_iid):
+            return  # collapsed: it loads fresh next time it's opened
+        store = self.get_store()
+        if store is None:
+            return
+        subject_iid = next((c for c in self.tree.get_children(student_iid)
+                            if self.tree.item(c, "text") == subject and c in self.meta), None)
+        if subject_iid is not None:
+            if self._is_open(subject_iid) and subject_iid not in self._loading:
+                self._loading.add(subject_iid)
+                self._run(self._fetch_children, store, subject_iid, self.meta[subject_iid])
+        elif student_iid not in self._loading:
+            self._loading.add(student_iid)  # first photo for this subject: its folder is new
+            self._run(self._fetch_children, store, student_iid, self.meta[student_iid])
+
 
     @staticmethod
     def _pretty_time(name):

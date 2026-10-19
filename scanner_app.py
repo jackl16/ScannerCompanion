@@ -693,6 +693,9 @@ class ScannerApp(tk.Tk):
                     self._update_port_status(port, payload)
                 elif kind == "scan":
                     self._handle_scan(payload)
+                elif kind == "photo_uploaded":
+                    if self._widget_alive("photo_browser"):
+                        self.photo_browser.on_uploaded(port, payload)
         except queue.Empty:
             pass
         finally:
@@ -863,7 +866,10 @@ class ScannerApp(tk.Tk):
                                     "A browser window will open. Sign in to the Google account that should store the photos.")
             self.config(cursor="watch")
             self.update_idletasks()
-            self.photo_worker = UploadWorker(DriveStore())
+            self.photo_worker = UploadWorker(
+                DriveStore(),
+                on_uploaded=lambda sid, subj: self.scan_queue.put(("photo_uploaded", sid, subj)),
+            )
             return True
         except Exception as e:
             messagebox.showerror("Photo Capture", f"Couldn't connect to Google Drive:\n{e}")
@@ -932,6 +938,7 @@ class ScannerApp(tk.Tk):
         self._play_feedback_sound(is_success=True)
         self.status_label.config(text=f"Found: {label} ({' + '.join(subjects)})", fg=COLORS["success"])
         self._photo_busy = True
+        total = len(subjects)
 
         def next_subject():
             if not subjects:
@@ -951,7 +958,12 @@ class ScannerApp(tk.Tk):
                 next_subject()
 
             try:
-                PhotoDialog(self, f"{subject} - {label}", done)
+                step = total - len(subjects)  # subject was just popped, so this is 1-based
+                PhotoDialog(
+                    self, label, done,
+                    subtitle=subject if total == 1 else f"{subject}  •  photo {step} of {total}",
+                    theme={"colors": COLORS, "font": FONT},
+                )
             except Exception as e:
                 self._photo_busy = False
                 self._log(f"Camera error: {e}")
