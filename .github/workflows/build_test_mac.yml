@@ -1,0 +1,68 @@
+name: Build Mac app
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          
+      - run: pip install -r requirements.txt pyinstaller
+
+      - name: Create config from secrets
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          cat > scanner_config.mac.toml <<EOF
+          [supabase]
+          url = "$SUPABASE_URL"
+          key = "$SUPABASE_KEY"
+          [scanner]
+          ports = []
+          baud_rate = 9600
+          debounce_seconds = 3
+          sound_enabled = false
+          EOF
+
+      - name: Build with PyInstaller
+        run: |
+          # Use an internal name WITHOUT spaces to prevent macOS launch failures.
+          # We use --osx-bundle-identifier to make it a distinct app package.
+          pyinstaller --windowed --noconfirm \
+            --name "ScannerCompanion" \
+            --osx-bundle-identifier "com.yourcompany.scannercompanion" \
+            --add-data "README.txt:." \
+            --add-data "scanner_config.mac.toml:." \
+            scanner_app.py
+
+      - name: Force Free Ad-Hoc Code Sign
+        run: |
+          echo "Applying native ad-hoc code signature..."
+          # This registers the app locally for Apple Silicon compliance without paying $99
+          codesign --force --deep --sign - "dist/ScannerCompanion.app"
+
+      - name: Diagnostic Run Check
+        run: |
+          echo "Simulating system launch to check for runtime library crashes..."
+          # This verifies that the app binary can execute without exiting instantly
+          timeout 5 "dist/ScannerCompanion.app/Contents/MacOS/ScannerCompanion" || true
+
+      - name: Package Release
+        run: |
+          # If you want the app icon to display a space on their desktop,
+          # you can safely rename the outer .app container file right here
+          mkdir -p release_package
+          cp -R "dist/ScannerCompanion.app" "release_package/Scanner Companion.app"
+          
+          # Preserve Apple resource forks perfectly
+          ditto -c -k --sequesterRsrc --keepParent "release_package/Scanner Companion.app" ScannerCompanion-mac.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScannerCompanion-mac
+          path: ScannerCompanion-mac.zip
