@@ -24,7 +24,8 @@ import tempfile
 from collections import OrderedDict
 
 from datetime import datetime
-from tkinter import messagebox, ttk
+from tkinter import ttk
+from ui_kit import messagebox
 
 from scanner_db import BASE_DIR as BASE
 

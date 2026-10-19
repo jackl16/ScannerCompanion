@@ -15,20 +15,24 @@ from tkinter import messagebox
 
 CURRENT_VERSION = "1.0.4"
 MANIFEST_URL = "https://raw.githubusercontent.com/jackl16/ScannerCompanion/refs/heads/main/version.json"
+NORMAL_SIZE = "680x640"
 
 import csv
 import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import ttk, filedialog
 from datetime import datetime
 import os           
 import requests
 import subprocess
 import sys
 from pathlib import Path
-
+import customtkinter as ctk
+from ui_kit import (COLORS, FONT, MONO, font, TopBar, StatusText,
+                    LastScanCard, ScanLog, StatusPanel, ActionButton, MenuPanel,
+                    messagebox,simpledialog)
 
 try:
     import winsound
@@ -82,8 +86,6 @@ def list_scanner_ports():
         ]
     return sorted(ports, key=lambda p: p.device)        
 
-FONT = "Segoe UI" if sys.platform == "win32" else "Helvetica Neue"
-MONO = "Consolas" if sys.platform == "win32" else "Menlo"
 
 # Minimum time between two accepted reads on the *same physical port*.
 # Cheap USB barcode scanners occasionally double-fire on a single swipe
@@ -91,21 +93,21 @@ MONO = "Consolas" if sys.platform == "win32" else "Menlo"
 # separate lines a few milliseconds apart. 
 MIN_SCAN_INTERVAL_SECONDS = 1.0
 
-COLORS = {
-    "bg": "#121214",          # app background (soft slate)
-    "card": "#1a1a1e",         # panels/cards
-    "border": "#27272a",  
-    "text": "#f4f4f5", 
-    "text_muted": "#a1a1aa",
-    "primary": "#4f46e5",  
-    "primary_dark": "#4338ca",
-    "primary_light": "#DBEAFE",
-    "on_primary": "#FFFFFF",
-    "success": "#10b981",  
-    "error": "#ef4444",    
-    "warning": "#f59e0b",
-    "log_text": "#39ff14",     # matrix-green scan log text
-}
+# COLORS = {
+#     "bg": "#121214",          # app background (soft slate)
+#     "card": "#1a1a1e",         # panels/cards
+#     "border": "#27272a",  
+#     "text": "#f4f4f5", 
+#     "text_muted": "#a1a1aa",
+#     "primary": "#4f46e5",  
+#     "primary_dark": "#4338ca",
+#     "primary_light": "#DBEAFE",
+#     "on_primary": "#FFFFFF",
+#     "success": "#10b981",  
+#     "error": "#ef4444",    
+#     "warning": "#f59e0b",
+#     "log_text": "#39ff14",     # matrix-green scan log text
+# }
 
 
 class SerialReaderThread(threading.Thread):
@@ -173,13 +175,14 @@ class PortProbeThread(threading.Thread):
             self.output_queue.put(("probe_status", self.port, f"error: {e}"))
 
 
-class ScannerApp(tk.Tk):
+class ScannerApp(ctk.CTk):
     def __init__(self):
-        super().__init__()
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        super().__init__(fg_color=COLORS["bg"])
         self.title("Scanner Companion")
-        self.geometry("560x560")
+        self.geometry(NORMAL_SIZE)
         self.resizable(False, False)
-        self.configure(bg=COLORS["bg"])
 
         self._setup_style()
 
@@ -222,18 +225,13 @@ class ScannerApp(tk.Tk):
             self._show_login_screen()
 
         self.after(2000, lambda: self.check_for_updates(silent=True))
-        self.after(150, self._load_custom_icon)
+        self.after(250, self._load_custom_icon)
     # --- VISUAL STYLE -----------------------------------------------------
     def _load_custom_icon(self):
-        """Loads the window icon asynchronously after the main GUI has finished drawing."""
         try:
-            from PIL import Image, ImageTk
-            icon_raw = Image.open("app_icon.ico")
-            self.app_icon_photo = ImageTk.PhotoImage(icon_raw)
-            self.iconphoto(False, self.app_icon_photo)
+            self.iconbitmap(str(resource_path("app_icon.ico")))
         except Exception:
-            # If the asset file vanishes or fails to decode, fall back cleanly
-            pass
+            pass  # missing or unsupported on this OS: keep the default
 
     def _setup_style(self):
         """One place for the whole app's look. 'clam' is the only built-in
@@ -294,31 +292,33 @@ class ScannerApp(tk.Tk):
         style.map("Treeview", background=[("selected", COLORS["primary"])],
                   foreground=[("selected", COLORS["on_primary"])])
 
-    def _make_menu(self) -> tk.Menu:
-        """Plain tk.Menu -- used both for the native top menu bar's dropdowns
-        and, later, for any popup menus. tk.Menu doesn't take ttk styling,
-        so it renders with the OS's native menu look, which is the point."""
-        return tk.Menu(self, tearoff=0)
+    def _make_menu(self):
+        return MenuPanel(self)
 
-    def _build_menu_bar(self):
-        """The real File/Edit/View-style menu bar along the top of the
-        window (not part of the blue header -- this is a separate Tk
-        concept, set via self.config(menu=...))."""
-        menu_bar = tk.Menu(self, tearoff=0)
+    def _header(self, text: str):
+        self.topbar = TopBar(self, text, CURRENT_VERSION)
+        self.topbar.pack(fill="x")
+        return self.topbar
 
+    def _clear_menu_bar(self):
+        pass  # no native menu bar any more; menus live in the top bar
+
+    def _build_menu_bar(self, with_status=True):
+        """Top-bar menus. with_status=False is used on the Detect Scanner screen, where
+        there are no live scanner connections or scan log to act on."""
         account_menu = self._make_menu()
-        account_menu.add_command(label="Export Scan Log", command=self._export_scan_log) 
-        account_menu.add_command(label="Clear Scan Log", command=self._clear_scan_log)
-        account_menu.add_separator()
+        if with_status:
+            account_menu.add_command(label="Export Scan Log", command=self._export_scan_log)
+            account_menu.add_command(label="Clear Scan Log", command=self._clear_scan_log)
+            account_menu.add_separator()
         account_menu.add_command(label="Logout", command=self._logout)
         account_menu.add_command(label="Exit", command=self.destroy)
-        menu_bar.add_cascade(label="File", menu=account_menu)
-
 
         settings_menu = self._make_menu()
         self.settings_menu = settings_menu
-        settings_menu.add_command(label="🔎 Detect Scanner", command=self._show_scanner_setup_screen)
-        settings_menu.add_separator()
+        if with_status:
+            settings_menu.add_command(label="🔎 Detect Scanner", command=self._show_scanner_setup_screen)
+            settings_menu.add_separator()
         settings_menu.add_checkbutton(
             label="Enable Audio Feedback",
             variable=self.sound_enabled,
@@ -329,39 +329,24 @@ class ScannerApp(tk.Tk):
         self._photo_toggle_added = False
         if self.db.photo_unlocked:
             self._add_photo_toggle()
-        menu_bar.add_cascade(label="Settings", menu=settings_menu)
-
-        # Status -- one entry per port, updated live as scans/errors come in.
-        self.status_menu = self._make_menu()
-        self.status_menu_indices = {}
-        for i, port in enumerate(self.db.serial_ports):
-            self.status_menu.add_command(label=f"{port}  …", state="disabled")
-            self.status_menu_indices[port] = i
-            
-        # FIXED: Removed the "Status: …" placeholder from the top text title
-        menu_bar.add_cascade(label="Status", menu=self.status_menu)
-        self.port_statuses = {port: "connecting" for port in self.db.serial_ports}
-
-
 
         help_menu = self._make_menu()
         help_menu.add_command(label="Check for Updates...", command=lambda: self.check_for_updates(silent=False))
         help_menu.add_separator()
         help_menu.add_command(label="📖 View Setup Guide", command=self._open_setup_guide)
-        help_menu.add_command(label="🔌 Troubleshoot Connection...", command=self._show_troubleshooting_wizard) # New wizard
+        help_menu.add_command(label="🔌 Troubleshoot Connection...", command=self._show_troubleshooting_wizard)
         help_menu.add_separator()
         help_menu.add_command(label="ℹ️ About Scanner Companion", command=self._show_about_popup)
-        menu_bar.add_cascade(label="Help", menu=help_menu)
 
-        self.menu_bar = menu_bar
-        self.config(menu=menu_bar)
-
-    def _clear_menu_bar(self):
-        """Removes the top menu bar -- used on screens (login, setup) that
-        shouldn't show it. Needed because the menu bar is attached to the
-        window itself, not the content area, so _clear_window() alone
-        doesn't touch it."""
-        self.config(menu=tk.Menu(self))
+        if with_status:
+            self.port_statuses = {port: "connecting" for port in self.db.serial_ports}
+            self.status_panel = StatusPanel(self, self.db.serial_ports,
+                                            on_detect=self._show_scanner_setup_screen)
+            self.status_pill = self.topbar.add_pill(
+                lambda: self.status_panel.toggle(self.status_pill))
+        self.topbar.add_menu("Account", account_menu)
+        self.topbar.add_menu("Settings", settings_menu)
+        self.topbar.add_menu("Help", help_menu, width=66)
 
     def _style_listbox(self, listbox: tk.Listbox):
         listbox.configure(
@@ -371,153 +356,158 @@ class ScannerApp(tk.Tk):
             relief="flat", borderwidth=0, font=(MONO, 10),
         )
 
-    def _header(self, text: str):
-        """Full-width blue banner used at the top of every screen."""
-        header = ttk.Frame(self, style="Header.TFrame", padding=(16, 14))
-        header.pack(fill="x", pady=(0, 0))
-        ttk.Label(header, text=text, style="Header.TLabel").pack(side="left")
-        return header
+    # def _header(self, text: str):
+    #     """Full-width blue banner used at the top of every screen."""
+    #     header = ttk.Frame(self, style="Header.TFrame", padding=(16, 14))
+    #     header.pack(fill="x", pady=(0, 0))
+    #     ttk.Label(header, text=text, style="Header.TLabel").pack(side="left")
+    #     return header
 
     # --- LOGIN SCREEN ---------------------------------------------------
 
     def _show_login_screen(self):
         self._clear_window()
         self._clear_menu_bar()
+        self._use_normal_window()
         self._header("Scanner Companion")
 
-        # --- 1. SETUP THE CUSTOM DARK ENTRY STYLE PARAMETERS ---
-        # We build a unique sub-style specifically for dark text entries
-        style = ttk.Style()
-        style.configure(
-            "DarkEntry.TEntry",
-            fieldbackground=COLORS["card"],  
-            foreground="#ffffff",        
-            insertcolor="#ffffff",        
-            bordercolor=COLORS["border"],  
-            lightcolor=COLORS["border"],
-            darkcolor=COLORS["border"]
-        )
-        # -------------------------------------------------------
-
-        outer = ttk.Frame(self, padding=40)
+        outer = ctk.CTkFrame(self, fg_color="transparent")
         outer.pack(expand=True)
+        card = ctk.CTkFrame(outer, fg_color=COLORS["card"], corner_radius=16,
+                            border_width=1, border_color=COLORS["border"])
+        card.pack(padx=40, pady=20)
 
-        card = ttk.Frame(outer, style="Card.TFrame", padding=28)
-        card.pack()
+        ctk.CTkLabel(card, text="Staff login", font=font(22, "bold"),
+                     text_color=COLORS["text"]).pack(pady=(24, 2))
+        ctk.CTkLabel(card, text="Sign in to start scanning", font=font(12),
+                     text_color=COLORS["text_muted"]).pack(pady=(0, 18))
 
-        ttk.Label(card, text="🔒 Staff Login", style="CardTitle.TLabel").pack(pady=(0, 20))
+        form = ctk.CTkFrame(card, fg_color="transparent")
+        form.pack(padx=32, pady=(0, 24))
 
-        ttk.Label(card, text="Email", style="Card.TLabel").pack(anchor="w")
-        email_var = tk.StringVar()
-        
-        email_entry = ttk.Entry(card, textvariable=email_var, width=32, style="DarkEntry.TEntry")
-        email_entry.pack(pady=(2, 10))
-        email_entry.focus()
+        def field_label(text):
+            ctk.CTkLabel(form, text=text, font=font(12), anchor="w",
+                         text_color=COLORS["text_muted"]).pack(fill="x", pady=(0, 4))
 
-        ttk.Label(card, text="Password", style="Card.TLabel").pack(anchor="w")
-        pw_var = tk.StringVar()
-        
-        pw_entry = ttk.Entry(card, textvariable=pw_var, show="*", width=32, style="DarkEntry.TEntry")
-        pw_entry.pack(pady=(2, 10))
+        entry_opts = dict(width=300, height=40, corner_radius=10, font=font(13),
+                          fg_color=COLORS["bg"], border_color=COLORS["border"])
+        field_label("Email")
+        email_entry = ctk.CTkEntry(form, **entry_opts)
+        email_entry.pack(fill="x", pady=(0, 12))
+        field_label("Password")
+        pw_entry = ctk.CTkEntry(form, show="*", **entry_opts)
+        pw_entry.pack(fill="x", pady=(0, 12))
 
         remember_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(card, text="Remember me", variable=remember_var).pack(pady=(0, 12), anchor="w")
+        ctk.CTkCheckBox(form, text="Remember me", variable=remember_var, font=font(12),
+                        checkbox_width=20, checkbox_height=20, corner_radius=5, border_width=2,
+                        border_color=COLORS["text_muted"], fg_color=COLORS["primary"],
+                        hover_color=COLORS["primary_dark"]).pack(anchor="w", pady=(0, 8))
 
-        error_label = ttk.Label(card, text="", style="Card.TLabel", foreground=COLORS["error"])
-        error_label.pack()
+        error_label = ctk.CTkLabel(form, text="", font=font(12), anchor="w", justify="left",
+                                   wraplength=300, text_color=COLORS["error"])
+        error_label.pack(fill="x")
 
         def try_login(event=None):
             self.db._remember = remember_var.get()  # must be set BEFORE sign_in
-            if self.db.sign_in(email_var.get(), pw_var.get()):
+            if self.db.sign_in(email_entry.get(), pw_entry.get()):
                 if self.db.serial_ports:
                     self._show_scanner_screen()
                 else:
                     self._show_scanner_setup_screen()
             else:
-                error_label.config(text=self.db.last_auth_error or "Login failed.")
-                pw_var.set("")
+                error_label.configure(text=self.db.last_auth_error or "Login failed.")
+                pw_entry.delete(0, "end")
 
+        email_entry.bind("<Return>", lambda e: pw_entry.focus())
         pw_entry.bind("<Return>", try_login)
-        ttk.Button(card, text="Login", command=try_login).pack(pady=(8, 0), fill="x")
+        ctk.CTkButton(form, text="Log in", command=try_login, height=40, corner_radius=10,
+                      font=font(14, "bold"), fg_color=COLORS["primary"],
+                      hover_color=COLORS["primary_dark"]).pack(fill="x", pady=(8, 0))
 
-        ttk.Label(outer, text=f"Scanner Companion v{CURRENT_VERSION}", style="Muted.TLabel").pack(pady=(12, 0))
-
+        ctk.CTkLabel(outer, text=f"Scanner Companion v{CURRENT_VERSION}", font=font(11),
+                     text_color=COLORS["text_muted"]).pack(pady=(4, 0))
+        self.after(150, email_entry.focus)
 
     # --- SCANNER DETECTION / SETUP SCREEN --------------------------------
 
     def _show_scanner_setup_screen(self):
-        """Lets the user pick candidate COM ports (or just select them all)
-        and scan a barcode once. Whichever port the scan actually arrives
-        on gets saved as the configured scanner -- no need to know in
-        advance which port is the real one."""
+        """Pick candidate COM ports, then scan a barcode on each scanner. Every port that
+        receives a scan is saved as a configured scanner."""
         self._clear_window()
         self._clear_menu_bar()
         self._stop_reader_threads()  # release any ports the main scanner screen was holding open
         self.probe_stop_event.clear()
         self.probe_port_vars = {}
         self.confirmed_scanner_ports = []
+        self._use_normal_window()
 
-        self._header("🔎 Detect Scanner(s)")
+        self._header("Detect Scanners")
+        self._build_menu_bar(with_status=False)
 
-        frame = ttk.Frame(self, padding=20)
-        frame.pack(fill="both", expand=True)
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=24, pady=(16, 18))
 
-        ttk.Label(
-            frame,
-            style="Muted.TLabel",
-            text="Select the port(s) to check (or leave all checked if unsure),\n"
-                 "then scan a barcode on each scanner you want to enable.\n"
-                 "Each port that receives a scan gets added below -- scan on\n"
-                 "as many devices as you have, then hit Done.",
-        ).pack(anchor="w", pady=(0, 12))
+        ctk.CTkLabel(body, text="Find your scanners", font=font(20, "bold"), anchor="w",
+                     text_color=COLORS["text"]).pack(fill="x")
+        ctk.CTkLabel(body, anchor="w", justify="left", font=font(12), wraplength=620,
+                     text_color=COLORS["text_muted"],
+                     text="Tick the ports to check (leave all ticked if unsure), press Start, then "
+                          "scan any barcode on each scanner. Each port that receives a scan is "
+                          "added below.").pack(fill="x", pady=(2, 12))
 
-        ports_card = ttk.Frame(frame, style="Card.TFrame", padding=14)
-        ports_card.pack(fill="x", pady=(0, 12))
+        ports_card = ctk.CTkScrollableFrame(body, fg_color=COLORS["card"], corner_radius=12,
+                                            border_width=1, border_color=COLORS["border"],
+                                            height=120)
+        ports_card.pack(fill="x", pady=(0, 10))
 
         available_ports = list_scanner_ports()
         if not available_ports:
-            ttk.Label(
-                ports_card, style="Card.TLabel",
-                text="No serial ports found. Plug in the scanner and reopen this screen.",
-                foreground=COLORS["error"],
-            ).pack(anchor="w")
+            ctk.CTkLabel(ports_card, text="No serial ports found. Plug in the scanner, then "
+                                          "reopen this screen.", font=font(12), wraplength=560,
+                         justify="left", text_color=COLORS["error"]).pack(anchor="w", padx=8, pady=8)
         for port in available_ports:
             var = tk.BooleanVar(value=True)  # default: all candidates selected
-            label = f"{port.device} — {port.description}"
-            ttk.Checkbutton(ports_card, text=label, variable=var).pack(anchor="w", pady=2)
+            ctk.CTkCheckBox(ports_card, text=f"{port.device}  —  {port.description}", variable=var,
+                            font=font(12), checkbox_width=20, checkbox_height=20, corner_radius=5,
+                            border_width=2, border_color=COLORS["text_muted"],
+                            fg_color=COLORS["primary"],
+                            hover_color=COLORS["primary_dark"]).pack(anchor="w", padx=10, pady=5)
             self.probe_port_vars[port.device] = var
 
-        self.probe_status_label = ttk.Label(frame, text="", style="Muted.TLabel")
-        self.probe_status_label.pack(anchor="w", pady=(4, 4))
+        self.probe_status_label = StatusText(body, text="Press Start detection when you're ready.",
+                                             anchor="w")
+        self.probe_status_label.pack(fill="x")
 
-        ttk.Label(frame, text="Confirmed scanners:", font=(FONT, 9, "bold")).pack(anchor="w")
-        self.confirmed_label = ttk.Label(frame, text="(none yet)", style="Muted.TLabel")
-        self.confirmed_label.pack(anchor="w", pady=(0, 8))
+        confirmed_row = ctk.CTkFrame(body, fg_color="transparent")
+        confirmed_row.pack(fill="x", pady=(6, 12))
+        ctk.CTkLabel(confirmed_row, text="CONFIRMED", font=font(11, "bold"),
+                     text_color=COLORS["text_muted"]).pack(side="left")
+        self.confirmed_label = StatusText(confirmed_row, text="(none yet)", size=13)
+        self.confirmed_label.pack(side="left", padx=(10, 0))
 
-        button_row = ttk.Frame(frame)
-        button_row.pack(fill="x", pady=(4, 0))
-
-        self.probe_start_button = ttk.Button(
-            button_row, text="Start Detection", command=self._start_detection
-        )
+        button_row = ctk.CTkFrame(body, fg_color="transparent")
+        button_row.pack(fill="x")
+        self.probe_start_button = ActionButton(
+            button_row, text="Start detection", height=38, corner_radius=10, font=font(13, "bold"),
+            fg_color=COLORS["primary"], hover_color=COLORS["primary_dark"],
+            command=self._start_detection)
         self.probe_start_button.pack(side="left")
-
-        self.probe_done_button = ttk.Button(
-            button_row, text="Done", command=self._finish_detection, state="disabled"
-        )
+        self.probe_done_button = ActionButton(
+            button_row, text="Done", height=38, corner_radius=10, font=font(13, "bold"),
+            fg_color=COLORS["card_alt"], text_color_disabled=COLORS["text_muted"],
+            state="disabled", command=self._finish_detection)
         self.probe_done_button.pack(side="left", padx=(8, 0))
 
         if self.db.serial_ports:
-            ttk.Button(
-                button_row, text="Cancel", style="Secondary.TButton", command=self._cancel_detection
-            ).pack(side="left", padx=(8, 0))
-        ttk.Button(
-            button_row, text="Logout", style="Secondary.TButton", command=self._logout
-        ).pack(side="right")
+            ctk.CTkButton(button_row, text="Cancel", command=self._cancel_detection, height=38,
+                          corner_radius=10, font=font(13), fg_color=COLORS["card_alt"],
+                          hover_color=COLORS["border"], text_color=COLORS["text"]).pack(side="right")
 
-        self.probe_log_list = tk.Listbox(frame, height=8)
-        self._style_listbox(self.probe_log_list)
-        self.probe_log_list.pack(fill="both", expand=True, pady=(12, 0))
+        ctk.CTkLabel(body, text="ACTIVITY", font=font(11, "bold"),
+                     text_color=COLORS["text_muted"]).pack(anchor="w", pady=(16, 6))
+        self.probe_log_list = ScanLog(body, height=130)
+        self.probe_log_list.pack(fill="both", expand=True)
 
     def _start_detection(self):
         selected_ports = [p for p, var in self.probe_port_vars.items() if var.get()]
@@ -571,7 +561,8 @@ class ScannerApp(tk.Tk):
             text=f"{len(self.confirmed_scanner_ports)} scanner(s) confirmed. "
                  f"Scan another, or hit Done."
         )
-        self.probe_done_button.config(state="normal")
+        self.probe_done_button.configure(state="normal", fg_color=COLORS["success"],
+                                         hover_color="#16a34a")
 
     def _finish_detection(self):
         self._stop_probe_threads()
@@ -597,6 +588,8 @@ class ScannerApp(tk.Tk):
 
     def _probe_log(self, message: str):
         timestamp = datetime.now().strftime("%I:%M:%S %p")
+        if not self._widget_alive("probe_log_list"):
+            return
         self.probe_log_list.insert(0, f"[{timestamp}] {message}")
 
     # --- MAIN SCANNER SCREEN --------------------------------------------
@@ -611,59 +604,31 @@ class ScannerApp(tk.Tk):
         self._header("Scanner Companion")
         self._build_menu_bar()
 
-        # --- STATUS BAR COMPONENT ---
-        self.status_bar = tk.Frame(self, bd=0, relief=tk.SUNKEN, bg=COLORS["card"])
-        self.status_bar.pack(side=tk.BOTTOM, fill="x")
+        self.hero = LastScanCard(self)
+        self.hero.pack(fill="x", padx=20, pady=(16, 8))
 
-        # Dynamic connection icon indicator 
-        self.status_icon = tk.Label(self.status_bar, text="…", font=(FONT, 10, "bold"), bg=COLORS["card"])
-        self.status_icon.pack(side=tk.LEFT, padx=(10, 2), pady=4)
+        self.info_row = ctk.CTkFrame(self, fg_color="transparent")
+        self.info_row.pack(fill="x", padx=26)
+        self.status_label = StatusText(self.info_row, text="Waiting for scan...")
+        self.status_label.pack(side="left")
+        self.mode_label = StatusText(self.info_row, text="")
+        self.mode_label.pack(side="right")
+        self.pending_label = StatusText(self.info_row, text="")
+        self.pending_label.pack(side="right", padx=(0, 12))
 
-        # Dynamic action and feedback message label
-        self.status_label = tk.Label(self.status_bar, text="Waiting for scan...", font=(FONT, 10), bg=COLORS["card"], fg=COLORS["text_muted"])
-        self.status_label.pack(side=tk.LEFT, padx=4, pady=4)
+        self.log_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.log_frame.pack(fill="both", expand=True, padx=20, pady=(8, 16))
+        ctk.CTkLabel(self.log_frame, text="RECENT SCANS", font=font(11, "bold"),
+                     text_color=COLORS["text_muted"]).pack(anchor="w", pady=(0, 6))
+        self.log_list = ScanLog(self.log_frame, height=220)
+        self.log_list.pack(fill="both", expand=True)
 
-        # Offline-queue indicator -- blank when nothing is queued
-        self.pending_label = tk.Label(self.status_bar, text="", font=(FONT, 9, "bold"), bg=COLORS["card"])
-        self.pending_label.pack(side=tk.LEFT, padx=(12, 4), pady=4)
-        self.mode_label = tk.Label(self.status_bar, text="", font=(FONT, 9, "bold"), bg=COLORS["card"])
-        self.mode_label.pack(side=tk.LEFT, padx=(12, 4), pady=4)
-
-        # Version tag, tucked in the corner
-        tk.Label(
-            self.status_bar, text=f"v{CURRENT_VERSION}", font=(FONT, 8),
-            bg=COLORS["card"], fg=COLORS["text_muted"],
-        ).pack(side=tk.RIGHT, padx=(2, 10), pady=4)
-        # ---------------------------------------
-
-        self.log_frame = log_frame = ttk.Frame(self, padding=20)
-        log_frame.pack(fill="both", expand=True, padx=20, pady=20)
-        ttk.Label(log_frame, text="Scan Log", font=(FONT, 10, "bold")).pack(anchor="w")
-
-        list_container = tk.Frame(log_frame, bg=COLORS["card"])
-        list_container.pack(fill="both", expand=True)
-
-        self.log_list = tk.Listbox(list_container)
-        self._style_listbox(self.log_list)
-        self.log_list.pack(fill="both", expand=True) # Fills the entire log card container
-        
-
-        def _on_mouse_wheel(event):
-            # Windows sends mouse delta movements in factors of 120
-            # Dividing by -120 converts it into a uniform single line scroll step
-            step = -event.delta if sys.platform == "darwin" else int(-event.delta / 120)
-            self.log_list.yview_scroll(step, "units")
-            
-        self.log_list.bind("<MouseWheel>", _on_mouse_wheel)
-
-        #self._build_photo_search_bar()
         self._start_reader_threads()
         self._log(f"Signed in. Listening on: {', '.join(self.db.serial_ports)}")
         self._poll_job = self.after(100, self._poll_queue)
         self._update_pending_label()
-        self._refresh_mode_indicator()
         self._flush_job = self.after(20000, self._periodic_flush)
-
+        self._refresh_mode_indicator()
 
     def _start_reader_threads(self):
         self.stop_event.clear()
@@ -725,34 +690,20 @@ class ScannerApp(tk.Tk):
 
     def _update_port_status(self, port: str, status: str):
         self.port_statuses[port] = status
-        idx = self.status_menu_indices.get(port)
-        if idx is not None:
-            icon = "✅" if status == "connected" else "❌"
-            self.status_menu.entryconfig(idx, label=f"{port}   {icon} {status}")
+        if self._widget_alive("status_panel"):
+            self.status_panel.set_status(port, status)
 
-
-        # 🔴 CASE 1: ANY port has failed or disconnected completely
         if any(s not in ("connected", "connecting") for s in self.port_statuses.values()):
-            if hasattr(self, 'status_icon'):
-                self.status_icon.config(text="🔴", fg=COLORS["error"])
-            if hasattr(self, 'status_label'):
-                self.status_label.config(text="Error with a scanner...", fg=COLORS["error"])
-                
-        # 🟢 CASE 2: ALL configured ports are perfectly connected
+            state, text, color = "error", "Error with a scanner...", COLORS["error"]
         elif all(s == "connected" for s in self.port_statuses.values()):
-            if hasattr(self, 'status_icon'):
-                self.status_icon.config(text="🟢", fg=COLORS["success"])
-            if hasattr(self, 'status_label'):
-                # Reset back to standard message if it was previously erroring
-                self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
-                
-        # 🟡 CASE 3: Ports are currently attempting a hand-shake/reconnection loop
+            state, text, color = "ok", "Waiting for scan...", COLORS["text_muted"]
         else:
-            if hasattr(self, 'status_icon'):
-                self.status_icon.config(text="…", fg=COLORS["warning"])
-            if hasattr(self, 'status_label'):
-                self.status_label.config(text="Connecting to hardware...", fg=COLORS["text_muted"])
+            state, text, color = "connecting", "Connecting to hardware...", COLORS["text_muted"]
 
+        if self._widget_alive("status_pill"):
+            self.status_pill.set_state(state)
+        if self._widget_alive("status_label"):
+            self.status_label.config(text=text, fg=color)
 
     def _clear_scan_log(self):
         """Deletes all entries inside the main scan log view."""
@@ -807,26 +758,26 @@ class ScannerApp(tk.Tk):
             return
         if self.photo_mode_var.get():
             self.mode_label.config(text="📷 PHOTO MODE (no check-in)", fg=COLORS["warning"])
+            self.hero.pack_forget()
             self._ensure_photo_widgets()
             self.photo_search_frame.pack(fill="x", before=self.log_frame)
             self.photo_browser.pack(fill="both", expand=True, padx=20, pady=(8, 0), before=self.log_frame)
-            self.log_frame.configure(padding=(10, 6))
-            self.log_frame.pack_configure(expand=False, padx=20, pady=(8, 12))
-            self.log_list.config(height=6)
+            self.log_frame.pack(fill="both", expand=False, padx=20, pady=(8, 12))
+            self.log_list.configure(height=130)
             self.resizable(True, True)
-            self.minsize(760, 620)
-            self.geometry("900x720")
+            self.minsize(760, 640)
+            self.geometry("900x760")
         else:
             self.mode_label.config(text="")
             for name in ("photo_search_frame", "photo_browser"):
                 if self._widget_alive(name):
                     getattr(self, name).pack_forget()
-            self.log_frame.configure(padding=20)
-            self.log_frame.pack_configure(expand=True, padx=20, pady=20)
-            self.log_list.config(height=10)
+            self.hero.pack(fill="x", padx=20, pady=(16, 8), before=self.info_row)
+            self.log_frame.pack(fill="both", expand=True, padx=20, pady=(8, 16))
+            self.log_list.configure(height=220)
             self.minsize(1, 1)
             self.resizable(False, False)
-            self.geometry("560x560")
+            self.geometry(NORMAL_SIZE)
 
     def _ensure_photo_widgets(self):
         if not self._widget_alive("photo_search_frame"):
@@ -1052,6 +1003,7 @@ class ScannerApp(tk.Tk):
     def _logout(self):
         if not messagebox.askyesno("Log out", "Are you sure you want to log out?"):
             return
+        self._stop_probe_threads()
         self._stop_reader_threads()
         self.db.sign_out()
         self._show_login_screen()
@@ -1094,7 +1046,11 @@ class ScannerApp(tk.Tk):
             "queued": COLORS["warning"],
         }
         # Change foreground to fg here
-        self.status_label.config(text=message, fg=colors.get(status, COLORS["text"]))
+        if status == "debounced":
+            self.status_label.config(text=message, fg=COLORS["text_muted"])
+        else:
+            self.hero.show(status, message)
+            self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
 
         if status != "debounced":
             self._log(message)
@@ -1141,12 +1097,14 @@ class ScannerApp(tk.Tk):
             "2. Navigate to 'Settings -> Detect Scanner' to re-verify port parameters.\n"
             "3. Ensure no other student attendance or tracking software is open.\n"
             "4. Try moving the cable into a different physical USB port slot.\n\n"
-            "If the bottom health status bar continues to display a red '🔴', "
+            "If the health status bar continues to display an error, "
             "please contact jackli6140@gmail.com with the details."
         )
         messagebox.showinfo("Hardware Troubleshooting Guide", tips)
 
     def _log(self, message: str):
+        if not self._widget_alive("log_list"):
+            return
         timestamp = datetime.now().strftime("%I:%M:%S %p")
         self.log_list.insert(0, f"[{timestamp}] {message}")
 
@@ -1255,7 +1213,7 @@ class ScannerApp(tk.Tk):
         
         try:
             # Update footer display state visually so the user doesn't close it mid-stream
-            if hasattr(self, 'status_label'):
+            if self._widget_alive("status_label"):
                 self.status_label.config(text="📥 Downloading software update... Please wait.", fg=COLORS["warning"])
                 self.update()
 
@@ -1300,7 +1258,8 @@ class ScannerApp(tk.Tk):
                 
         except Exception as e:
             messagebox.showerror("Update Interrupted", f"Could not complete installation:\n{e}")
-            self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
+            if self._widget_alive("status_label"):
+                self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
 
     def _play_feedback_sound(self, is_success=True):
         """Plays a native Windows beep pattern if audio feedback is enabled."""
@@ -1331,6 +1290,11 @@ class ScannerApp(tk.Tk):
                     pass
         self._poll_job = None
         self._flush_job = None
+
+    def _use_normal_window(self):
+        self.minsize(1, 1)
+        self.resizable(False, False)
+        self.geometry(NORMAL_SIZE)
 
     def _clear_window(self):
         self._cancel_scanner_loops()
