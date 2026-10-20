@@ -39,6 +39,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from google.auth.exceptions import RefreshError
 
 DEFAULT_THEME = {
     "colors": {"bg": "#121214", "card": "#1a1a1e", "border": "#27272a", "text": "#f4f4f5",
@@ -77,12 +78,23 @@ class DriveStore:
         creds = None
         if os.path.exists(TOKEN_FILE):
             creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+                try:
+                    creds.refresh(Request())
+                except RefreshError:
+                    # Token expired/revoked (invalid_grant): discard it and sign in again
+                    creds = None
+                    try:
+                        os.remove(TOKEN_FILE)
+                    except OSError:
+                        pass
+
+            if not creds or not creds.valid:
                 flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
                 creds = flow.run_local_server(port=0)
+
             with open(TOKEN_FILE, "w") as f:
                 f.write(creds.to_json())
         return creds
