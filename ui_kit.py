@@ -523,10 +523,16 @@ class ListPicker(ctk.CTkToplevel):
                                         height=min(340, 62 * len(items) + 8))
         scroll.pack(fill="both", expand=True, padx=12, pady=(0, 6))
         for i, (name, sub) in enumerate(items):
-            ctk.CTkButton(scroll, text=f"{name}\n{sub}", anchor="w", height=54, corner_radius=10,
-                          fg_color=COLORS["card_alt"], hover_color=COLORS["border"],
-                          text_color=COLORS["text"], font=font(13),
-                          command=lambda i=i: self._choose(i)).pack(fill="x", pady=3)
+            btn = ctk.CTkButton(scroll, text=f"{name}\n{sub}", anchor="w", height=54, corner_radius=10,
+                                border_spacing=14,
+                                fg_color=COLORS["card_alt"], hover_color=COLORS["border"],
+                                text_color=COLORS["text"], font=font(13),
+                                command=lambda i=i: self._choose(i))
+            try:
+                btn._text_label.configure(justify="left")  # left-align both lines, not center
+            except Exception:
+                pass
+            btn.pack(fill="x", pady=3)
         ctk.CTkButton(card, text="Cancel", height=36, corner_radius=10, font=font(13),
                       fg_color="transparent", hover_color=COLORS["card_alt"],
                       text_color=COLORS["text_muted"], command=self.destroy
