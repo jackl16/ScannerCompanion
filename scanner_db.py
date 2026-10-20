@@ -129,6 +129,10 @@ class ScannerDB:
         self.photo_unlocked = bool(features_cfg.get("drive_photos", False))
         self.photo_mode = self.photo_unlocked and bool(features_cfg.get("photo_mode", False))
 
+        appearance_cfg = config.get("appearance", {})
+        self.log_pills = bool(appearance_cfg.get("log_pills", False))
+        self.log_terminal = bool(appearance_cfg.get("log_terminal", False))
+
         self._last_scan_id = None
         self._last_scan_time = 0
         self.last_refresh_ok = True
@@ -322,6 +326,12 @@ class ScannerDB:
         config.setdefault("features", {})["photo_mode"] = enabled
         save_config(config)
         self.photo_mode = enabled
+
+    def save_log_style(self, pills: bool, terminal: bool) -> None:
+        config = load_config()
+        config.setdefault("appearance", {}).update({"log_pills": pills, "log_terminal": terminal})
+        save_config(config)
+        self.log_pills, self.log_terminal = pills, terminal
 
     # --- local time helpers ---
 

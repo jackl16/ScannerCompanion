@@ -9,6 +9,8 @@ import customtkinter as ctk
 FONT = "Segoe UI" if sys.platform == "win32" else "Helvetica Neue"
 MONO = "Consolas" if sys.platform == "win32" else "Menlo"
 
+LOG_STYLE = {"pills": False, "terminal": False}
+
 COLORS = {
     "bg": "#0f0f12",
     "card": "#18181c",
@@ -63,6 +65,17 @@ def _dispatch_click(event):
         except Exception:
             pass
     _registry["panels"] = alive
+
+
+def set_log_style(pills: bool, terminal: bool):
+    LOG_STYLE["pills"], LOG_STYLE["terminal"] = bool(pills), bool(terminal)
+
+
+def _tint(hex_color, base=COLORS["card"], amount=0.12):
+    """Blend a color into the card background for a subtle wash."""
+    c = hex_color.lstrip("#"); b = base.lstrip("#")
+    mix = [round(int(b[i:i+2], 16) * (1 - amount) + int(c[i:i+2], 16) * amount) for i in (0, 2, 4)]
+    return "#%02x%02x%02x" % tuple(mix)
 
 
 class Popover(ctk.CTkFrame):
@@ -267,6 +280,7 @@ class ScanLog(ctk.CTkScrollableFrame):
         super().__init__(master, fg_color=COLORS["card"], corner_radius=12,
                          border_width=1, border_color=COLORS["border"], height=height)
         self._items = []  # newest first: (text, row widget)
+        self._mono = ctk.CTkFont(family=MONO, size=11)
 
     @staticmethod
     def _parse(text):
@@ -283,21 +297,81 @@ class ScanLog(ctk.CTkScrollableFrame):
             return COLORS["error"]
         return COLORS["text_muted"]           # everything else is neutral
 
-    def insert(self, index, text):
+    @staticmethod
+    def _tag(msg):
+        """Short label for the pill, derived from the message text."""
+        low = msg.lower()
+        if "staff" in low and "clocked in" in low:
+            return "STAFF IN"
+        if "staff" in low and "clocked out" in low:
+            return "STAFF OUT"
+        if "checked in" in low:
+            return "IN"
+        if "checked out" in low:
+            return "OUT"
+        if any(w in low for w in ("not found", "error", "failed", "unrecognized",
+                                  "not recognized", "withdrawn")):
+            return "ERROR"
+        if "photo" in low:
+            return "PHOTO"
+        if "offline" in low or "queued" in low:
+            return "QUEUED"
+        if "synced" in low:
+            return "SYNC"
+        if "scanner found" in low:
+            return "SCANNER"
+        return "INFO"
+
+    def _build_row(self, text):
         stamp, msg = self._parse(text)
         color = self._color(msg)
-        row = ctk.CTkFrame(self, fg_color="transparent")
-        ctk.CTkLabel(row, text="●", width=18, font=font(12),
-                     text_color=color).pack(side="left", padx=(8, 4))
-        ctk.CTkLabel(row, text=msg, font=font(12), anchor="w", justify="left", wraplength=500,
-                     text_color=color).pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(row, text=stamp, font=font(11),
-                     text_color=COLORS["text_muted"]).pack(side="right", padx=8)
+        neutral = color == COLORS["text_muted"]
+        tag = self._tag(msg)
+        msg = re.sub(r"^[^\x00-\x7F]+\s*", "", msg)   # drop leading emoji
+
+        pills, terminal = LOG_STYLE["pills"], LOG_STYLE["terminal"]
+        accent = not pills and not terminal            # bar + tint is the default look
+
+        row = ctk.CTkFrame(self, corner_radius=8,
+                           fg_color=_tint(color) if accent and not neutral else "transparent")
+
+        if terminal:
+            ctk.CTkLabel(row, text=stamp, width=88, anchor="w", font=self._mono,
+                         text_color=COLORS["text_muted"]).pack(side="left", padx=(10, 6))
+        if pills:
+            ctk.CTkLabel(row, text=tag, width=64, height=20, corner_radius=10,
+                         font=font(10, "bold"), text_color=color,
+                         fg_color=COLORS["card_alt"] if neutral else _tint(color, amount=0.22)
+                         ).pack(side="left", padx=(0 if terminal else 10, 10), pady=6)
+        if accent:
+            ctk.CTkFrame(row, width=3,height=1 ,corner_radius=2,
+                         fg_color=COLORS["border"] if neutral else color
+                         ).pack(side="left", fill="y", padx=(8, 10), pady=7)
+
+        ctk.CTkLabel(row, text=msg, font=font(12, "normal" if neutral or terminal else "bold"),
+                     anchor="w", justify="left", wraplength=500 - (74 if pills else 0),
+                     text_color=color).pack(side="left", fill="x", expand=True, pady=6)
+        if not terminal:
+            ctk.CTkLabel(row, text=stamp, font=font(11),
+                         text_color=COLORS["text_muted"]).pack(side="right", padx=10)
+        return row
+
+    def insert(self, index, text):
+        row = self._build_row(text)
         if self._items:
-            row.pack(fill="x", pady=1, before=self._items[0][1])
+            row.pack(fill="x", pady=2, padx=2, before=self._items[0][1])
         else:
-            row.pack(fill="x", pady=1)
+            row.pack(fill="x", pady=2, padx=2)
         self._items.insert(0, (text, row))
+
+    def restyle(self):
+        """Rebuild every row with the current LOG_STYLE (called when a toggle changes)."""
+        texts = [t for t, _ in reversed(self._items)]   # oldest first
+        for _, row in self._items:
+            row.destroy()
+        self._items = []
+        for t in texts:
+            self.insert(0, t)
 
     def _remove(self, i):
         if self._items:

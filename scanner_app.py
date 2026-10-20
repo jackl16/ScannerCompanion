@@ -32,7 +32,7 @@ from pathlib import Path
 import customtkinter as ctk
 from ui_kit import (COLORS, FONT, MONO, font, TopBar, StatusText,
                     LastScanCard, ScanLog, StatusPanel, ActionButton, MenuPanel,
-                    messagebox,simpledialog, ListPicker)
+                    messagebox,simpledialog, ListPicker, set_log_style)
 
 try:
     import winsound
@@ -197,6 +197,11 @@ class ScannerApp(ctk.CTk):
         # loaded from scanner_config.toml, so the toggle survives restarts
         # instead of silently resetting to off every launch
         self.sound_enabled = tk.BooleanVar(value=self.db.sound_enabled)
+
+        self.log_pills_var = tk.BooleanVar(value=self.db.log_pills)
+        self.log_terminal_var = tk.BooleanVar(value=self.db.log_terminal)
+        set_log_style(self.db.log_pills, self.db.log_terminal)
+
         self.photo_mode_var = tk.BooleanVar(value=self.db.photo_mode)
         self._photo_toggle_added = False
         self._photo_busy = False
@@ -327,6 +332,16 @@ class ScannerApp(ctk.CTk):
             variable=self.sound_enabled,
             command=lambda: self.db.save_sound_enabled(self.sound_enabled.get()),
         )
+        settings_menu.add_checkbutton(
+            label="Pill tags in scan log",
+            variable=self.log_pills_var,
+            command=self._on_log_style_changed,
+        )
+        settings_menu.add_checkbutton(
+            label="Timestamp-first scan log",
+            variable=self.log_terminal_var,
+            command=self._on_log_style_changed,
+        )        
         settings_menu.add_separator()
         settings_menu.add_command(label="🔑 Add Feature...", command=self._prompt_feature_code)
         self._photo_toggle_added = False
@@ -712,6 +727,14 @@ class ScannerApp(ctk.CTk):
         """Deletes all entries inside the main scan log view."""
         if hasattr(self, 'log_list'):
             self.log_list.delete(0, tk.END)
+
+    def _on_log_style_changed(self):
+        pills, terminal = self.log_pills_var.get(), self.log_terminal_var.get()
+        set_log_style(pills, terminal)
+        self.db.save_log_style(pills, terminal)
+        for name in ("log_list", "probe_log_list"):   # main log and the Detect Scanners log
+            if self._widget_alive(name):
+                getattr(self, name).restyle()
 
     # --- PHOTO CAPTURE FEATURE ------------------------------------------
 
