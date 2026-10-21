@@ -64,6 +64,10 @@ TOKEN_FILE = os.path.join(BASE, "token.json")
 BARCODE_COL, FIRST_COL, LAST_COL = "barcode_code", "first_name", "last_name"
 MATH_COL, READING_COL = "math", "reading"  # a Y (or true) means the student does that subject
 
+def _open_camera(index):
+    backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+    return cv2.VideoCapture(index, backend)
+
 
 class DriveStore:
     def __init__(self, keep_copies=KEEP_COPIES):
@@ -172,7 +176,7 @@ class PhotoDialog(ctk.CTkToplevel):
 
     PREVIEW_W = 640  # raise to ~800 for a bigger preview if the screen allows
 
-    def __init__(self, parent, label, on_done, confirm=CONFIRM_PHOTO, subtitle="", theme=None):
+    def __init__(self, parent, label, on_done, confirm=CONFIRM_PHOTO, subtitle="", theme=None, camera_index=CAMERA_INDEX):
         super().__init__(parent)
         self.withdraw()
         self.configure(fg_color=COLORS["bg"])
@@ -182,6 +186,7 @@ class PhotoDialog(ctk.CTkToplevel):
         self.shot, self.frozen, self.closed = None, False, False
         self.zoom = 1.0
         self._tick_job = self._act_job = None
+        self.cam = _open_camera(camera_index)
 
         self.cam = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)  # CAP_DSHOW opens faster on Windows
         if not self.cam.isOpened():
@@ -215,8 +220,9 @@ class PhotoDialog(ctk.CTkToplevel):
         self.box.pack(padx=20)
         cam_w = int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
         cam_h = int(self.cam.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
-        self._pv_h = int(cam_h * self.PREVIEW_W / cam_w)
-        self._blank = tk.PhotoImage(width=self.PREVIEW_W, height=self._pv_h)
+        self.preview_w = self._fit_preview_width(cam_w / cam_h)
+        self._pv_h = int(self.preview_w * cam_h / cam_w)
+        self._blank = tk.PhotoImage(width=self.preview_w, height=self._pv_h)
         self.view = tk.Label(self.box, image=self._blank, bg=COLORS["bg"], bd=0)
         self.view.pack(padx=6, pady=6)
 
@@ -327,7 +333,7 @@ class PhotoDialog(ctk.CTkToplevel):
             if ok:
                 frame = self._crop(frame)
                 self.shot = frame
-                small = cv2.resize(frame, (self.PREVIEW_W, self._pv_h))
+                small = cv2.resize(frame, (self.preview_w, self._pv_h))
                 self._photo_img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
                 self.view.configure(image=self._photo_img)  # keep a reference or Tk drops the image
         self._tick_job = self.after(30, self._tick)
@@ -364,6 +370,142 @@ class PhotoDialog(ctk.CTkToplevel):
         self.destroy()
         self.on_done(result)
 
+    def _fit_preview_width(self, aspect):
+        """Shrinks the preview on short screens so the whole dialog (buttons included) fits."""
+        scale = max(self.winfo_fpixels("1i") / 96, 1.0)            # Windows display scaling
+        room = self.winfo_screenheight() - 120 - int(300 * scale)   # screen minus taskbar/title bar and the controls
+        height = max(200, min(room, int(self.PREVIEW_W / aspect)))
+        return int(height * aspect)
+
+class CameraPicker(ctk.CTkToplevel):
+    """Cycles through connected cameras with a live preview; the user picks the one to use."""
+
+    MAX_INDEX = 6        # camera indices 0-5 are tried
+    W, H = 400, 300
+
+    def __init__(self, parent, current_index, on_pick):
+        super().__init__(parent)
+        self.withdraw()
+        self.configure(fg_color=COLORS["bg"])
+        self.title("Choose Camera")
+        self.resizable(False, False)
+        self.on_pick = on_pick
+        self.cam, self.index, self.closed, self._job = None, None, False, None
+
+        card = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=16,
+                            border_width=1, border_color=COLORS["border"])
+        card.pack(fill="both", expand=True, padx=12, pady=12)
+        self.title_label = ctk.CTkLabel(card, text="", font=font(16, "bold"), text_color=COLORS["text"])
+        self.title_label.pack(padx=20, pady=(16, 2))
+        self.note = ctk.CTkLabel(card, text="", font=font(12), text_color=COLORS["text_muted"])
+        self.note.pack(padx=20, pady=(0, 10))
+        self._blank = tk.PhotoImage(width=self.W, height=self.H)
+        self.view = tk.Label(card, image=self._blank, bg=COLORS["bg"], bd=0)
+        self.view.pack(padx=20)
+
+        bar = ctk.CTkFrame(card, fg_color="transparent")
+        bar.pack(pady=16)
+        secondary = dict(height=40, corner_radius=12, font=font(13), fg_color=COLORS["card_alt"],
+                         hover_color=COLORS["border"], text_color=COLORS["text"])
+        ctk.CTkButton(bar, text="Next camera", width=130, command=self._on_next,
+                      **secondary).pack(side="left", padx=5)
+        ctk.CTkButton(bar, text="Use this camera", width=150, height=40, corner_radius=12,
+                      font=font(13, "bold"), fg_color=COLORS["primary"],
+                      hover_color=COLORS["primary_dark"], text_color=COLORS["on_primary"],
+                      command=self._use).pack(side="left", padx=5)
+        ctk.CTkButton(bar, text="Cancel", width=90, command=self.close,
+                      **secondary).pack(side="left", padx=5)
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        self.bind("<Return>", lambda e: self._use())
+        center_over(self, parent)
+        self.transient(parent)
+        self.deiconify()
+        self.after(100, self._activate)
+
+        if not self._open(current_index) and not self._cycle():
+            self.title_label.configure(text="No camera found")
+            self.note.configure(text="Plug in a camera and try again.")
+        self._tick()
+
+    def _activate(self):
+        if self.closed:
+            return
+        try:
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+
+    def _release(self):
+        if self.cam is not None:
+            self.cam.release()
+            self.cam = None
+
+    def _open(self, i):
+        self._release()
+        cam = _open_camera(i)
+        if cam.isOpened() and cam.read()[0]:
+            self.cam, self.index = cam, i
+            w = int(cam.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            h = int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            self.title_label.configure(text=f"Camera {i + 1}")
+            self.note.configure(text=f"{w} × {h}" if w and h else "")
+            return True
+        cam.release()
+        return False
+
+    def _cycle(self):
+        """Opens the next camera that works, wrapping around."""
+        start = -1 if self.index is None else self.index
+        for step in range(1, self.MAX_INDEX + 1):
+            if self._open((start + step) % self.MAX_INDEX):
+                return True
+        return False
+
+    def _on_next(self):
+        prev = self.index
+        self.note.configure(text="Looking...")
+        self.update_idletasks()
+        if not self._cycle():
+            self.title_label.configure(text="No camera found")
+            self.note.configure(text="")
+        elif self.index == prev:
+            self.note.configure(text="No other camera found")
+
+    def _tick(self):
+        if self.closed:
+            return
+        if self.cam is not None:
+            ok, frame = self.cam.read()
+            if ok:
+                img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                img.thumbnail((self.W, self.H))
+                bg = Image.new("RGB", (self.W, self.H), COLORS["bg"])      # letterbox on the dark background
+                bg.paste(img, ((self.W - img.width) // 2, (self.H - img.height) // 2))
+                self._img = ImageTk.PhotoImage(bg)
+                self.view.configure(image=self._img)
+        self._job = self.after(40, self._tick)
+
+    def _use(self):
+        if self.cam is None:
+            return
+        idx = self.index
+        self.close()
+        self.on_pick(idx)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self._job:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+        self._release()
+        self.destroy()
 
 class UploadWorker(threading.Thread):
     """Uploads in the background so a slow connection never blocks the next scan."""

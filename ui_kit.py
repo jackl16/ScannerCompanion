@@ -571,7 +571,9 @@ def center_over(win, parent):
     else:
         x = (win.winfo_screenwidth() - w) // 2
         y = (win.winfo_screenheight() - h) // 2
-    win.wm_geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+    x = max(0, min(x, win.winfo_screenwidth() - w))
+    y = max(0, min(y, win.winfo_screenheight() - h - 48))   # keep clear of the taskbar
+    win.wm_geometry(f"{w}x{h}+{x}+{y}")
 
 
 class ListPicker(ctk.CTkToplevel):

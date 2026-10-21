@@ -758,6 +758,7 @@ class ScannerApp(ctk.CTk):
             variable=self.photo_mode_var,
             command=self._on_photo_mode_toggled,
         )
+        self.settings_menu.add_command(label="Choose Camera...", command=self._choose_camera)
         self._photo_toggle_added = True
 
     def _on_photo_mode_toggled(self):
@@ -917,6 +918,7 @@ class ScannerApp(ctk.CTk):
         self._photo_busy = True
         total = len(subjects)
 
+
         def next_subject():
             if not subjects:
                 self._photo_busy = False
@@ -940,12 +942,25 @@ class ScannerApp(ctk.CTk):
                     self, label, done,
                     subtitle=subject if total == 1 else f"{subject}  •  photo {step} of {total}",
                     theme={"colors": COLORS, "font": FONT},
+                    camera_index=self.db.camera_index,
                 )
             except Exception as e:
                 self._photo_busy = False
                 self._log(f"Camera error: {e}")
 
         next_subject()
+
+    def _choose_camera(self):
+        if self._photo_busy:
+            messagebox.showinfo("Choose Camera", "Finish the current photo first.")
+            return
+        from photo_capture import CameraPicker
+
+        def picked(index):
+            self.db.save_camera_index(index)
+            self._log(f"Camera set to Camera {index + 1}")
+
+        CameraPicker(self, self.db.camera_index, picked)
 
     def _build_photo_search_bar(self):
         """Created when photo mode first turns on; only shown while it's on."""

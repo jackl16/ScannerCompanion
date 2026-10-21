@@ -133,6 +133,8 @@ class ScannerDB:
         self.log_pills = bool(appearance_cfg.get("log_pills", False))
         self.log_terminal = bool(appearance_cfg.get("log_terminal", False))
 
+        self.camera_index = int(config.get("camera", {}).get("index", 0))
+
         self._last_scan_id = None
         self._last_scan_time = 0
         self.last_refresh_ok = True
@@ -313,6 +315,12 @@ class ScannerDB:
         config.setdefault("scanner", {})["sound_enabled"] = enabled
         save_config(config)
         self.sound_enabled = enabled
+
+    def save_camera_index(self, index: int) -> None:
+        config = load_config()
+        config.setdefault("camera", {})["index"] = int(index)
+        save_config(config)
+        self.camera_index = int(index)
 
     # --- features ----
     def unlock_photo_feature(self) -> None:
