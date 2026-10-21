@@ -371,10 +371,11 @@ class PhotoDialog(ctk.CTkToplevel):
         self.on_done(result)
 
     def _fit_preview_width(self, aspect):
-        """Shrinks the preview on short screens so the whole dialog (buttons included) fits."""
-        scale = max(self.winfo_fpixels("1i") / 96, 1.0)            # Windows display scaling
-        room = self.winfo_screenheight() - 120 - int(300 * scale)   # screen minus taskbar/title bar and the controls
-        height = max(200, min(room, int(self.PREVIEW_W / aspect)))
+        """Keeps the preview modest: at most ~35% of the screen height, and never taller than what fits."""
+        scale = max(self.winfo_fpixels("1i") / 96, 1.0)           # Windows display scaling
+        screen_h = self.winfo_screenheight()
+        room = screen_h - 120 - int(210 * scale)                   # minus taskbar/title bar and the controls
+        height = max(180, min(room, int(screen_h * 0.35), int(self.PREVIEW_W / aspect)))
         return int(height * aspect)
 
 class CameraPicker(ctk.CTkToplevel):
