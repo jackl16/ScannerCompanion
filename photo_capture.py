@@ -180,6 +180,7 @@ class PhotoDialog(ctk.CTkToplevel):
         self.resizable(False, False)
         self.on_done, self.confirm = on_done, confirm
         self.shot, self.frozen, self.closed = None, False, False
+        self.zoom = 1.0
         self._tick_job = self._act_job = None
 
         self.cam = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)  # CAP_DSHOW opens faster on Windows
@@ -187,6 +188,9 @@ class PhotoDialog(ctk.CTkToplevel):
             messagebox.showerror("Camera", "Camera not found", parent=parent)
             self.finish(None)
             return
+
+        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
         card = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=16,
                             border_width=1, border_color=COLORS["border"])
@@ -211,7 +215,22 @@ class PhotoDialog(ctk.CTkToplevel):
         self.box.pack(padx=20)
         cam_w = int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
         cam_h = int(self.cam.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
-        self._blank = tk.PhotoImage(width=self.PREVIEW_W, height=int(cam_h * self.PREVIEW_W / cam_w))
+        self._pv_h = int(cam_h * self.PREVIEW_W / cam_w)
+        self._blank = tk.PhotoImage(width=self.PREVIEW_W, height=self._pv_h)
+        self.view = tk.Label(self.box, image=self._blank, bg=COLORS["bg"], bd=0)
+        self.view.pack(padx=6, pady=6)
+
+        zrow = ctk.CTkFrame(card, fg_color="transparent")
+        zrow.pack(pady=(10, 0))
+        ctk.CTkLabel(zrow, text="Zoom", font=font(12),
+                     text_color=COLORS["text_muted"]).pack(side="left", padx=(0, 10))
+        self.zoom_slider = ctk.CTkSlider(zrow, from_=1.0, to=4.0, number_of_steps=30, width=300,
+                                         progress_color=COLORS["primary"], command=self._set_zoom)
+        self.zoom_slider.set(1.0)
+        self.zoom_slider.pack(side="left")
+        self.zoom_label = ctk.CTkLabel(zrow, text="1.0×", width=44, font=font(12, "bold"),
+                                       text_color=COLORS["text"])
+        self.zoom_label.pack(side="left", padx=(10, 0))
         self.view = tk.Label(self.box, image=self._blank, bg=COLORS["bg"], bd=0)
         self.view.pack(padx=6, pady=6)
 
@@ -242,6 +261,11 @@ class PhotoDialog(ctk.CTkToplevel):
         self.bind("<Return>", lambda e: self.keep())
         self.bind("<r>", lambda e: self.retake())
         self.bind("<Escape>", lambda e: self.finish(None))
+        for key in ("<plus>", "<equal>", "<KP_Add>"):
+            self.bind(key, lambda e: self._set_zoom(self.zoom + 0.5))
+        for key in ("<minus>", "<KP_Subtract>"):
+            self.bind(key, lambda e: self._set_zoom(self.zoom - 0.5))
+        self.view.bind("<MouseWheel>", lambda e: self._set_zoom(self.zoom + (0.2 if e.delta > 0 else -0.2)))
         self.protocol("WM_DELETE_WINDOW", lambda: self.finish(None))
 
         center_over(self, parent)
@@ -268,6 +292,7 @@ class PhotoDialog(ctk.CTkToplevel):
 
     def _set_mode(self, reviewing):
         if reviewing:
+            self.zoom_slider.configure(state="disabled" if reviewing else "normal")
             self.box.configure(border_color=COLORS["warning"])
             self.state_label.configure(text="REVIEW", fg_color=COLORS["warning"], text_color="#1c1203")
             self.hint.configure(text="Enter = keep      R = retake      Esc = cancel")
@@ -278,14 +303,31 @@ class PhotoDialog(ctk.CTkToplevel):
             self.hint.configure(text="Space = capture      Esc = cancel")
             self._layout(["capture", "cancel"])
 
+    def _crop(self, frame):
+        """Digital zoom: keep the centre 1/zoom of the frame (what you see is what gets saved)."""
+        if self.zoom <= 1.0:
+            return frame
+        h, w = frame.shape[:2]
+        cw, ch = int(w / self.zoom), int(h / self.zoom)
+        x, y = (w - cw) // 2, (h - ch) // 2
+        return frame[y:y + ch, x:x + cw]
+
+    def _set_zoom(self, value):
+        if self.frozen:
+            return
+        self.zoom = round(max(1.0, min(4.0, float(value))), 1)
+        self.zoom_slider.set(self.zoom)
+        self.zoom_label.configure(text=f"{self.zoom:.1f}×")
+
     def _tick(self):
         if self.closed:
             return
         if not self.frozen:
             ok, frame = self.cam.read()
             if ok:
+                frame = self._crop(frame)
                 self.shot = frame
-                small = cv2.resize(frame, (self.PREVIEW_W, int(frame.shape[0] * self.PREVIEW_W / frame.shape[1])))
+                small = cv2.resize(frame, (self.PREVIEW_W, self._pv_h))
                 self._photo_img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
                 self.view.configure(image=self._photo_img)  # keep a reference or Tk drops the image
         self._tick_job = self.after(30, self._tick)
@@ -409,7 +451,11 @@ class PhotoBrowser(ctk.CTkFrame):
         self._loading = set()
         self._job = None
         self._img = None
-
+        self._pil = None                 # full-size photo currently previewed
+        self._zoom = 1.0                 # 1.0 = fit to the box
+        self._pan_x = self._pan_y = 0.0
+        self._drag = None
+        
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
@@ -452,17 +498,34 @@ class PhotoBrowser(ctk.CTkFrame):
         self.caption.pack(fill="x", padx=16, pady=(14, 0))
         self.preview_box = ctk.CTkFrame(right, width=300, height=260, fg_color=COLORS["bg"],
                                         corner_radius=10, border_width=1, border_color="#3f3f46")
-        self.preview_box.pack_propagate(False)  # the photo can't resize its own box
+        self.preview_box.pack_propagate(False)
         self.preview_box.pack(fill="both", expand=True, padx=14, pady=10)
-        self.preview = tk.Label(self.preview_box, text="Select a photo to preview it here",
-                                bg=COLORS["bg"], fg=COLORS["text_muted"], font=(FONT, 12))
-        self.preview.pack(fill="both", expand=True, padx=6, pady=6)
-        self.open_btn = ctk.CTkButton(right, text="Open full size", height=34, corner_radius=8,
-                                      font=font(12), fg_color=COLORS["card_alt"],
-                                      hover_color=COLORS["border"], text_color=COLORS["text"],
-                                      text_color_disabled=COLORS["text_muted"],
-                                      state="disabled", command=self._open_selected)
-        self.open_btn.pack(anchor="e", padx=14, pady=(0, 12))
+        self.canvas = tk.Canvas(self.preview_box, bg=COLORS["bg"], highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True, padx=6, pady=6)
+
+        tools = ctk.CTkFrame(right, fg_color="transparent")
+        tools.pack(fill="x", padx=14, pady=(0, 12))
+        btn_style = dict(height=34, corner_radius=8, font=font(12), fg_color=COLORS["card_alt"],
+                         hover_color=COLORS["border"], text_color=COLORS["text"])
+        self.open_btn = ctk.CTkButton(tools, text="Open full size", text_color_disabled=COLORS["text_muted"],
+                                      state="disabled", command=self._open_selected, **{
+                                          **btn_style, "text_color": COLORS["text"]})
+        self.open_btn.pack(side="right")
+        ctk.CTkButton(tools, text="Fit", width=52, command=self._fit, **btn_style).pack(side="right", padx=(0, 8))
+        self.zoom_slider = ctk.CTkSlider(tools, from_=1.0, to=6.0, number_of_steps=50, width=160,
+                                         progress_color=COLORS["primary"],
+                                         command=lambda v: self._zoom_at(float(v)))
+        self.zoom_slider.set(1.0)
+        self.zoom_slider.pack(side="left")
+        self.zoom_label = ctk.CTkLabel(tools, text="1.0×", width=44, font=font(12, "bold"),
+                                       text_color=COLORS["text"])
+        self.zoom_label.pack(side="left", padx=(8, 0))
+
+        self.canvas.bind("<Configure>", lambda e: self._render())
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<ButtonPress-1>", self._drag_start)
+        self.canvas.bind("<B1-Motion>", self._drag_move)
+        self.canvas.bind("<Double-Button-1>", lambda e: self._fit())
 
         self.tree.bind("<<TreeviewOpen>>", self._on_open)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
@@ -627,11 +690,8 @@ class PhotoBrowser(ctk.CTkFrame):
                 f.write(data)
             _open_external(path)
         elif fid == self._want:
-            img = Image.open(io.BytesIO(data))
-            img.thumbnail((max(self.preview_box.winfo_width() - 20, 200),
-                           max(self.preview_box.winfo_height() - 20, 200)))
-            self._img = ImageTk.PhotoImage(img)  # keep a reference or Tk drops it
-            self.preview.config(image=self._img, text="")
+            self._pil = Image.open(io.BytesIO(data)).convert("RGB")
+            self._fit()
 
     def _is_open(self, iid):
         return str(self.tree.item(iid, "open")).lower() in ("1", "true")
@@ -667,3 +727,70 @@ class PhotoBrowser(ctk.CTkFrame):
             return stamp.strftime("%b %d, %Y  %I:%M %p")
         except ValueError:
             return name
+
+    # --- zoom / pan viewer ---
+
+    def _render(self):
+        c = self.canvas
+        cw, ch = c.winfo_width(), c.winfo_height()
+        if cw < 20 or ch < 20:
+            return
+        c.delete("all")
+        if self._pil is None:
+            c.create_text(cw // 2, ch // 2, text="Select a photo to preview it here",
+                          fill=COLORS["text_muted"], font=(FONT, 12))
+            return
+        iw, ih = self._pil.size
+        scale = min(cw / iw, ch / ih) * self._zoom
+        dw, dh = iw * scale, ih * scale
+        mx, my = max(0.0, (dw - cw) / 2), max(0.0, (dh - ch) / 2)   # can't drag the photo off-screen
+        self._pan_x = max(-mx, min(mx, self._pan_x))
+        self._pan_y = max(-my, min(my, self._pan_y))
+        ox = cw / 2 + self._pan_x - dw / 2      # top-left of the photo on the canvas
+        oy = ch / 2 + self._pan_y - dh / 2
+        vx0, vy0 = max(0.0, -ox), max(0.0, -oy)  # visible part, in display pixels
+        vx1, vy1 = min(dw, cw - ox), min(dh, ch - oy)
+        box = (max(0.0, vx0 / scale), max(0.0, vy0 / scale), min(iw, vx1 / scale), min(ih, vy1 / scale))
+        size = (max(1, round(vx1 - vx0)), max(1, round(vy1 - vy0)))
+        # only the visible part is resized, so dragging stays smooth even at high zoom
+        self._img = ImageTk.PhotoImage(self._pil.resize(size, Image.BILINEAR, box=box))
+        c.create_image(round(ox + vx0), round(oy + vy0), image=self._img, anchor="nw")
+
+    def _zoom_at(self, new_zoom, px=None, py=None):
+        """Zoom toward a point (the cursor), or the centre if none is given."""
+        if self._pil is None:
+            return
+        new_zoom = max(1.0, min(6.0, new_zoom))
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        px = cw / 2 if px is None else px
+        py = ch / 2 if py is None else py
+        iw, ih = self._pil.size
+        fit = min(cw / iw, ch / ih)
+        old, new = fit * self._zoom, fit * new_zoom
+        ox = cw / 2 + self._pan_x - iw * old / 2
+        oy = ch / 2 + self._pan_y - ih * old / 2
+        u, v = (px - ox) / old, (py - oy) / old          # photo point under the cursor
+        self._pan_x = px - u * new - cw / 2 + iw * new / 2
+        self._pan_y = py - v * new - ch / 2 + ih * new / 2
+        self._zoom = new_zoom
+        self.zoom_slider.set(new_zoom)
+        self.zoom_label.configure(text=f"{new_zoom:.1f}×")
+        self._render()
+
+    def _fit(self):
+        self._zoom, self._pan_x, self._pan_y = 1.0, 0.0, 0.0
+        self.zoom_slider.set(1.0)
+        self.zoom_label.configure(text="1.0×")
+        self._render()
+
+    def _on_wheel(self, e):
+        self._zoom_at(self._zoom * (1.25 if e.delta > 0 else 0.8), e.x, e.y)
+
+    def _drag_start(self, e):
+        self._drag = (e.x, e.y, self._pan_x, self._pan_y)
+
+    def _drag_move(self, e):
+        if self._drag and self._pil is not None:
+            x0, y0, px, py = self._drag
+            self._pan_x, self._pan_y = px + e.x - x0, py + e.y - y0
+            self._render()
