@@ -68,6 +68,11 @@ INVALID_TOKEN_MARKERS = (
     "session_not_found", "user_not_found",
 )
 
+import keyring
+from keyring.errors import PasswordDeleteError
+
+KR_SERVICE, KR_SESSION = "ScannerCompanion", "supabase-session"
+
 
 class AuthError(Exception):
     """Raised when the configured scanner account can't sign in."""
@@ -180,14 +185,16 @@ class ScannerDB:
         exception at all was wiping the file, even ones that had nothing
         to do with the token itself.
         """
-        if not SESSION_FILE.exists():
+        try:
+            raw = keyring.get_password(KR_SERVICE, KR_SESSION)
+        except Exception:
+            raw = None
+        if not raw:
             return False
 
         try:
-            saved = json.loads(SESSION_FILE.read_text())
-            refresh_token = saved["refresh_token"]
+            refresh_token = json.loads(raw)["refresh_token"]
         except Exception:
-            # the file itself is corrupt/unreadable -- nothing to restore
             self.forget_remembered_session()
             return False
 
@@ -247,10 +254,15 @@ class ScannerDB:
                 pass
 
     def remember_session(self, refresh_token: str):
-        SESSION_FILE.write_text(json.dumps({"refresh_token": refresh_token}))
+        keyring.set_password(KR_SERVICE, KR_SESSION, json.dumps({"refresh_token": refresh_token}))
+
 
     def forget_remembered_session(self):
-        if SESSION_FILE.exists():
+        try:
+            keyring.delete_password(KR_SERVICE, KR_SESSION)
+        except PasswordDeleteError:
+            pass
+        if SESSION_FILE.exists():          # clean up the old plain file from earlier versions
             SESSION_FILE.unlink()
 
     def _finish_login(self, session) -> bool:

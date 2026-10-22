@@ -17,6 +17,10 @@ CURRENT_VERSION = "1.0.4"
 MANIFEST_URL = "https://raw.githubusercontent.com/jackl16/ScannerCompanion/refs/heads/main/version.json"
 NORMAL_SIZE = "680x640"
 
+import math
+import struct
+import tempfile
+import wave
 import csv
 import queue
 import threading
@@ -45,6 +49,18 @@ import serial.tools.list_ports
 from scanner_db import ScannerDB, BASE_DIR
 from features import check_feature_code
 
+import hashlib
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+UPDATE_PUBLIC_KEY = "paste the PUBLIC KEY hex here"
+
+def _update_is_authentic(version, sha_hex, sig_hex) -> bool:
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(UPDATE_PUBLIC_KEY)).verify(
+            bytes.fromhex(sig_hex), f"{version}:{sha_hex}".encode())
+        return True
+    except Exception:
+        return False
 
 def _ver(v) -> tuple:
     """'1.0.10' -> (1, 0, 10), so versions compare numerically."""
@@ -67,6 +83,44 @@ def open_path(path) -> None:
         subprocess.run(["open", str(path)])
     else:
         subprocess.run(["xdg-open", str(path)])
+
+SAMPLE_RATE = 44100
+
+def _render_notes(notes, volume=0.35):
+    """notes: list of (freq_hz, start_sec, length_sec). Returns 16-bit PCM bytes.
+    Each note is a sine plus soft overtones with a fast attack and exponential
+    decay, which gives a bell/chime feel instead of a harsh beep."""
+    total = max(start + length for _, start, length in notes) + 0.05
+    buf = [0.0] * int(SAMPLE_RATE * total)
+    for freq, start, length in notes:
+        offset = int(start * SAMPLE_RATE)
+        for i in range(int(length * SAMPLE_RATE)):
+            t = i / SAMPLE_RATE
+            env = min(1.0, t / 0.005) * math.exp(-5.0 * t / length)
+            w = (math.sin(2 * math.pi * freq * t)
+                 + 0.30 * math.sin(4 * math.pi * freq * t)
+                 + 0.10 * math.sin(6 * math.pi * freq * t)) / 1.4
+            buf[offset + i] += volume * env * w
+    return b"".join(struct.pack("<h", int(max(-1.0, min(1.0, s)) * 32767)) for s in buf)
+
+def build_feedback_sounds() -> dict:
+    """Generates the success/error sounds once, as WAV files in a temp folder."""
+    sounds = {
+        "success": [(1047, 0.00, 0.16), (1568, 0.08, 0.28)],  # C6 -> G6, rising
+        "error":   [(330,  0.00, 0.18), (262,  0.12, 0.30)],  # E4 -> C4, falling
+    }
+    folder = Path(tempfile.mkdtemp(prefix="scanner_sounds_"))
+    paths = {}
+    for name, notes in sounds.items():
+        path = folder / f"{name}.wav"
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(_render_notes(notes))
+        paths[name] = str(path)
+    return paths
+
 
 def list_scanner_ports():
     """Serial ports worth probing as barcode scanners.
@@ -197,6 +251,10 @@ class ScannerApp(ctk.CTk):
         # loaded from scanner_config.toml, so the toggle survives restarts
         # instead of silently resetting to off every launch
         self.sound_enabled = tk.BooleanVar(value=self.db.sound_enabled)
+        try:
+            self._sound_files = build_feedback_sounds()
+        except Exception:
+            self._sound_files = {}  # sound just stays silent if generation fails
 
         self.log_pills_var = tk.BooleanVar(value=self.db.log_pills)
         self.log_terminal_var = tk.BooleanVar(value=self.db.log_terminal)
@@ -759,6 +817,7 @@ class ScannerApp(ctk.CTk):
             command=self._on_photo_mode_toggled,
         )
         self.settings_menu.add_command(label="Choose Camera...", command=self._choose_camera)
+        self.settings_menu.add_command(label="Disconnect Google Drive...", command=self._disconnect_google)
         self._photo_toggle_added = True
 
     def _on_photo_mode_toggled(self):
@@ -835,11 +894,8 @@ class ScannerApp(ctk.CTk):
         if self.photo_worker is not None:
             return True
         try:
-            from photo_capture import DriveStore, UploadWorker, CREDS_FILE, TOKEN_FILE
-            if not (os.path.exists(CREDS_FILE) or os.path.exists(TOKEN_FILE)):
-                messagebox.showerror("Photo Capture", f"credentials.json was not found.\n\nPlace it in:\n{BASE_DIR}")
-                return False
-            if not os.path.exists(TOKEN_FILE):
+            from photo_capture import DriveStore, UploadWorker, has_saved_login
+            if not has_saved_login():
                 messagebox.showinfo("Photo Capture",
                                     "A browser window will open. Sign in to the Google account that should store the photos.")
             self.config(cursor="watch")
@@ -961,6 +1017,42 @@ class ScannerApp(ctk.CTk):
             self._log(f"Camera set to Camera {index + 1}")
 
         CameraPicker(self, self.db.camera_index, picked)
+
+    def _disconnect_google(self):
+        if self._photo_busy:
+            messagebox.showinfo("Disconnect Google Drive", "Finish the current photo first.")
+            return
+        from photo_capture import disconnect_google, has_saved_login
+        if not has_saved_login() and self.photo_worker is None:
+            messagebox.showinfo("Disconnect Google Drive", "Google Drive isn't connected on this computer.")
+            return
+        if not messagebox.askyesno(
+            "Disconnect Google Drive",
+            "This signs this computer out of Google Drive and revokes its access.\n"
+            "Photos already uploaded stay in Drive.\n"
+            "Photo Capture will be turned off until you reconnect.\n\nDisconnect?"
+        ):
+            return
+
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            self._finish_photo_uploads()            # let queued uploads finish first
+            if self.photo_worker is not None:
+                self.photo_worker.stop()
+                self.photo_worker = None
+            if self.photo_mode_var.get():
+                self.photo_mode_var.set(False)
+                self.db.save_photo_mode(False)
+                self._refresh_mode_indicator()
+            if self._widget_alive("photo_browser"):
+                self.photo_browser.destroy()        # drops cached photos from memory
+            disconnect_google()
+        finally:
+            self.config(cursor="")
+        self._log("Google Drive disconnected")
+        messagebox.showinfo("Disconnect Google Drive",
+                            "Disconnected. Turn on Photo Capture Mode to sign in again.")
 
     def _build_photo_search_bar(self):
         """Created when photo mode first turns on; only shown while it's on."""
@@ -1196,7 +1288,7 @@ class ScannerApp(ctk.CTk):
                     # Prompt the user with a standard confirmation popup dialog box
                     msg = f"A new software update (v{remote_version}) is available!\n\nWhat's New:\n{data.get('changelog')}\n\nWould you like to download and apply the update now?"
                     if messagebox.askyesno("Update Available", msg):
-                        self._apply_background_update(download_url)
+                        self._apply_background_update(data)
                 else:
                     if not silent:
                         messagebox.showinfo("Up to Date", "You are running the latest version of Scanner Companion.")
@@ -1228,14 +1320,18 @@ class ScannerApp(ctk.CTk):
         #         os.startfile(downloads_dir)
         # except Exception as e:
         #     messagebox.showerror("Update Failed", f"Could not download update:\n{e}")
-    def _apply_background_update(self, download_url):
+    def _apply_background_update(self, data):
         """Downloads the new binary executable into a temp folder and triggers the file-swap batch handler."""
-
+        
+        download_url = data.get("url", "")
         if sys.platform != "win32":
             import webbrowser
             webbrowser.open(download_url)
-            return     
-        
+            return
+        if not download_url.startswith("https://"):
+            messagebox.showerror("Update Failed", "Update link is not secure.")
+            return
+
         try:
             # Update footer display state visually so the user doesn't close it mid-stream
             if self._widget_alive("status_label"):
@@ -1250,9 +1346,20 @@ class ScannerApp(ctk.CTk):
                 temp_new_exe = os.path.join(current_dir, "new_version.tmp")
                 bat_script_path = os.path.join(current_dir, "update_process.bat")
                 
+                h = hashlib.sha256()
                 with open(temp_new_exe, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
+                        h.update(chunk)
+
+                if not _update_is_authentic(data.get("version", ""), h.hexdigest(),
+                                            data.get("signature", "")):
+                    os.remove(temp_new_exe)
+                    messagebox.showerror("Update Failed",
+                                         "The downloaded update failed verification and was not installed.")
+                    if self._widget_alive("status_label"):
+                        self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
+                    return
                         
                 # Create the automated Windows Batch background loop to overwrite the locked exe file
                 # The loop tries to delete the old application until it closes, then renames the temp file
@@ -1287,24 +1394,21 @@ class ScannerApp(ctk.CTk):
                 self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
 
     def _play_feedback_sound(self, is_success=True):
-        """Plays a native Windows beep pattern if audio feedback is enabled."""
+        """Plays a short chime (success) or soft low tone (error) if audio feedback is on."""
         if not self.sound_enabled.get():
-            return  # Exit instantly if the user toggled sounds off
-            
-        
-        def run_sound():
-            try:
-                if winsound:
-                    winsound.Beep(1000, 150) if is_success else winsound.Beep(400, 400)
-                elif sys.platform == "darwin":
-                    name = "Glass" if is_success else "Basso"
-                    subprocess.Popen(["afplay", f"/System/Library/Sounds/{name}.aiff"])
-            except Exception:
-                pass # Fail silently if system audio drivers are locked down
-                
-        # Spawn the audio execution in a micro-thread branch so the main UI loop 
-        # doesn't freeze for a split second while the speaker card activates
-        threading.Thread(target=run_sound, daemon=True).start()
+            return
+        path = self._sound_files.get("success" if is_success else "error")
+        if not path:
+            return
+        try:
+            if winsound:
+                # SND_ASYNC returns immediately, and a new scan cuts off the previous
+                # sound, so rapid scans never pile up or freeze the UI
+                winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["afplay", path])
+        except Exception:
+            pass  # fail silently if audio drivers are locked down
 
     def _cancel_scanner_loops(self):
         for job in (self._poll_job, self._flush_job):

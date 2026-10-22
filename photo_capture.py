@@ -64,6 +64,56 @@ TOKEN_FILE = os.path.join(BASE, "token.json")
 BARCODE_COL, FIRST_COL, LAST_COL = "barcode_code", "first_name", "last_name"
 MATH_COL, READING_COL = "math", "reading"  # a Y (or true) means the student does that subject
 
+import json
+import keyring
+from keyring.errors import PasswordDeleteError
+import requests
+import glob
+
+from google_secrets import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+
+CLIENT_CONFIG = {"installed": {
+    "client_id": GOOGLE_CLIENT_ID,
+    "client_secret": GOOGLE_CLIENT_SECRET,
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "redirect_uris": ["http://localhost"],
+}}
+
+def has_saved_login() -> bool:
+    try:
+        return bool(keyring.get_password(KR_SERVICE, KR_USER))
+    except Exception:
+        return False
+
+def disconnect_google() -> None:
+    """Revokes this computer's Google access (best effort), then deletes the saved login
+    and any full-size photos that were opened into the temp folder."""
+    raw = None
+    try:
+        raw = keyring.get_password(KR_SERVICE, KR_USER)
+    except Exception:
+        pass
+    if raw:
+        try:
+            info = json.loads(raw)
+            token = info.get("refresh_token") or info.get("token")
+            requests.post("https://oauth2.googleapis.com/revoke", params={"token": token},
+                          headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=10)
+        except Exception:
+            pass  # offline or already revoked: still remove the local copy
+    try:
+        keyring.delete_password(KR_SERVICE, KR_USER)
+    except (PasswordDeleteError, Exception):
+        pass
+    for p in glob.glob(os.path.join(tempfile.gettempdir(), "scanner_photo_*.jpg")):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+KR_SERVICE, KR_USER = "ScannerCompanion", "google-drive"
+
 def _open_camera(index):
     backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
     return cv2.VideoCapture(index, backend)
@@ -80,27 +130,26 @@ class DriveStore:
     @staticmethod
     def _creds():
         creds = None
-        if os.path.exists(TOKEN_FILE):
-            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        raw = keyring.get_password(KR_SERVICE, KR_USER)
+        if raw:
+            creds = Credentials.from_authorized_user_info(json.loads(raw), SCOPES)
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 try:
                     creds.refresh(Request())
                 except RefreshError:
-                    # Token expired/revoked (invalid_grant): discard it and sign in again
                     creds = None
                     try:
-                        os.remove(TOKEN_FILE)
-                    except OSError:
+                        keyring.delete_password(KR_SERVICE, KR_USER)
+                    except PasswordDeleteError:
                         pass
 
             if not creds or not creds.valid:
-                flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
+                flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, SCOPES)
                 creds = flow.run_local_server(port=0)
 
-            with open(TOKEN_FILE, "w") as f:
-                f.write(creds.to_json())
+            keyring.set_password(KR_SERVICE, KR_USER, creds.to_json())
         return creds
 
     def _find_or_create(self, key, name, parent):
@@ -188,7 +237,6 @@ class PhotoDialog(ctk.CTkToplevel):
         self._tick_job = self._act_job = None
         self.cam = _open_camera(camera_index)
 
-        self.cam = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)  # CAP_DSHOW opens faster on Windows
         if not self.cam.isOpened():
             messagebox.showerror("Camera", "Camera not found", parent=parent)
             self.finish(None)
@@ -237,8 +285,6 @@ class PhotoDialog(ctk.CTkToplevel):
         self.zoom_label = ctk.CTkLabel(zrow, text="1.0×", width=44, font=font(12, "bold"),
                                        text_color=COLORS["text"])
         self.zoom_label.pack(side="left", padx=(10, 0))
-        self.view = tk.Label(self.box, image=self._blank, bg=COLORS["bg"], bd=0)
-        self.view.pack(padx=6, pady=6)
 
         self.bar = ctk.CTkFrame(card, fg_color="transparent")
         self.bar.pack(pady=(16, 6))
@@ -297,8 +343,8 @@ class PhotoDialog(ctk.CTkToplevel):
             self.buttons[n].pack(side="left", padx=5)
 
     def _set_mode(self, reviewing):
+        self.zoom_slider.configure(state="disabled" if reviewing else "normal")
         if reviewing:
-            self.zoom_slider.configure(state="disabled" if reviewing else "normal")
             self.box.configure(border_color=COLORS["warning"])
             self.state_label.configure(text="REVIEW", fg_color=COLORS["warning"], text_color="#1c1203")
             self.hint.configure(text="Enter = keep      R = retake      Esc = cancel")
@@ -521,9 +567,15 @@ class UploadWorker(threading.Thread):
     def submit(self, student_id, last, first, subject, jpeg, barcode=None):
         self.q.put((student_id, last, first, subject, jpeg, barcode))
 
+    def stop(self):
+        self.q.put(None)   # sentinel: finish anything already queued, then exit
+
     def run(self):
         while True:
             job = self.q.get()
+            if job is None:
+                self.q.task_done()
+                return
             for attempt in range(3):
                 try:
                     self.store.upload(*job)

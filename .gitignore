@@ -185,3 +185,6 @@ scanner_session.json
 scanner_config.toml
 token.json
 credentials.json
+google_secrets.py
+make_keys.py
+sign_release.py
