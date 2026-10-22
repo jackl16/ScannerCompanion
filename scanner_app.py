@@ -52,7 +52,7 @@ from features import check_feature_code
 import hashlib
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-UPDATE_PUBLIC_KEY = "paste the PUBLIC KEY hex here"
+UPDATE_PUBLIC_KEY = "691ef2872b0e842b94e232b9b5c6280175a950bfca6f4dd40ec5c01915283416"
 
 def _update_is_authentic(version, sha_hex, sig_hex) -> bool:
     try:
