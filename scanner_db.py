@@ -129,6 +129,7 @@ class ScannerDB:
         self.baud_rate = scanner_cfg.get("baud_rate", 9600)
         self.debounce_seconds = scanner_cfg.get("debounce_seconds", 3)
         self.sound_enabled = scanner_cfg.get("sound_enabled", False)
+        self.scanner_skipped = bool(scanner_cfg.get("skipped", False))
         
         features_cfg = config.get("features", {})
         self.photo_unlocked = bool(features_cfg.get("drive_photos", False))
@@ -312,13 +313,20 @@ class ScannerDB:
 
     # --- scanner config ---
 
-    def save_serial_ports(self, ports: list) -> None:
-        """Persists the detected scanner port(s) into scanner_config.toml,
-        preserving every other existing setting in the file."""
+    def save_scanner_skipped(self, skipped: bool) -> None:
         config = load_config()
-        config.setdefault("scanner", {})["ports"] = ports
+        config.setdefault("scanner", {})["skipped"] = skipped
         save_config(config)
-        self.serial_ports = ports  # keep the in-memory copy in sync too
+        self.scanner_skipped = skipped
+
+    def save_serial_ports(self, ports: list) -> None:
+        config = load_config()
+        scanner = config.setdefault("scanner", {})
+        scanner["ports"] = ports
+        scanner["skipped"] = False          # a real scanner was set up, so stop skipping
+        save_config(config)
+        self.serial_ports = ports           # keep the in-memory copy in sync too
+        self.scanner_skipped = False
 
     def save_sound_enabled(self, enabled: bool) -> None:
         """Persists the Audio Feedback toggle so it survives app restarts

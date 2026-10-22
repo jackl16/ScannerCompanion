@@ -504,7 +504,7 @@ class ScannerApp(ctk.CTk):
         def try_login(event=None):
             self.db._remember = remember_var.get()  # must be set BEFORE sign_in
             if self.db.sign_in(email_entry.get(), pw_entry.get()):
-                if self.db.serial_ports:
+                if self.db.serial_ports or self.db.scanner_skipped:
                     self._show_scanner_screen()
                 else:
                     self._show_scanner_setup_screen()
@@ -592,9 +592,13 @@ class ScannerApp(ctk.CTk):
             state="disabled", command=self._finish_detection)
         self.probe_done_button.pack(side="left", padx=(8, 0))
 
-        if self.db.serial_ports:
+        if self.db.serial_ports or self.db.scanner_skipped:
             ctk.CTkButton(button_row, text="Cancel", command=self._cancel_detection, height=38,
                           corner_radius=10, font=font(13), fg_color=COLORS["card_alt"],
+                          hover_color=COLORS["border"], text_color=COLORS["text"]).pack(side="right")
+        else:
+            ctk.CTkButton(button_row, text="Skip (no scanner)", command=self._skip_scanner_setup,
+                          height=38, corner_radius=10, font=font(13), fg_color=COLORS["card_alt"],
                           hover_color=COLORS["border"], text_color=COLORS["text"]).pack(side="right")
 
         ctk.CTkLabel(body, text="ACTIVITY", font=font(11, "bold"),
@@ -623,6 +627,11 @@ class ScannerApp(ctk.CTk):
 
         self.after(100, self._poll_probe_queue)
 
+    def _skip_scanner_setup(self):
+        self._stop_probe_threads()
+        self.db.save_scanner_skipped(True)
+        self._show_scanner_screen()
+        
     def _poll_probe_queue(self):
         try:
             while True:
@@ -690,7 +699,7 @@ class ScannerApp(ctk.CTk):
     def _show_scanner_screen(self):
         self._clear_window()
 
-        if not self.db.serial_ports:
+        if not self.db.serial_ports and not self.db.scanner_skipped:
             self._show_scanner_setup_screen()
             return
 
@@ -717,11 +726,16 @@ class ScannerApp(ctk.CTk):
         self.log_list.pack(fill="both", expand=True)
 
         self._start_reader_threads()
-        self._log(f"Signed in. Listening on: {', '.join(self.db.serial_ports)}")
+        self._log(f"Signed in. Listening on: {', '.join(self.db.serial_ports)}" if self.db.serial_ports
+                    else "Signed in. No scanner set up.")
         self._poll_job = self.after(100, self._poll_queue)
         self._update_pending_label()
         self._flush_job = self.after(20000, self._periodic_flush)
         self._refresh_mode_indicator()
+
+        if not self.db.serial_ports:
+            self.status_pill.set_state("error")
+            self.status_label.config(text="No scanner set up (Settings > Detect Scanner)", fg=COLORS["warning"])
 
     def _start_reader_threads(self):
         self.stop_event.clear()
@@ -1117,6 +1131,8 @@ class ScannerApp(ctk.CTk):
             requests.get(MANIFEST_URL, timeout=5).raise_for_status()
 
         def scanners():
+            if not self.port_statuses:
+                return "none set up"
             bad = [f"{p} ({s})" for p, s in self.port_statuses.items() if s != "connected"]
             if bad:
                 raise RuntimeError("not connected: " + ", ".join(bad))
