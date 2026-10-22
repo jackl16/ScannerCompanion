@@ -13,6 +13,10 @@ Run:
 import requests
 from tkinter import messagebox
 
+import logging
+from app_log import setup_logging, log_dir
+log = logging.getLogger("scanner")
+
 CURRENT_VERSION = "1.0.4"
 MANIFEST_URL = "https://raw.githubusercontent.com/jackl16/ScannerCompanion/refs/heads/main/version.json"
 NORMAL_SIZE = "680x640"
@@ -47,7 +51,9 @@ import serial
 import serial.tools.list_ports
 
 from scanner_db import ScannerDB, BASE_DIR
+PENDING_PHOTOS_DIR = BASE_DIR / "pending_photos"
 from features import check_feature_code
+
 
 import hashlib
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -178,9 +184,11 @@ class SerialReaderThread(threading.Thread):
     
 
     def run(self):
+        last_err = None
         while not self.stop_event.is_set():
             try:
                 with serial.Serial(self.port, self.baud_rate, timeout=1) as ser:
+                    last_err = None
                     self.output_queue.put(("status", self.port, "connected"))
                     while not self.stop_event.is_set():
                         line = ser.readline()
@@ -195,9 +203,11 @@ class SerialReaderThread(threading.Thread):
                                     continue
                                 self._last_read_time = now
                                 self.output_queue.put(("scan", self.port, decoded))
-            except serial.SerialException as e:
+            except Exception as e:
+                if str(e) != last_err:
+                    log.warning("Scanner port %s: %s", self.port, e)
+                    last_err = str(e)
                 self.output_queue.put(("status", self.port, f"error: {e}"))
-                # port not available yet (e.g. scanner unplugged) -- wait and retry
                 self.stop_event.wait(3)
 
 
@@ -234,6 +244,10 @@ class ScannerApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
         super().__init__(fg_color=COLORS["bg"])
+        self.report_callback_exception = self._on_tk_error
+        self._last_error_dialog = 0.0
+        self._testing = False
+        self._last_photo_retry = 0.0
         self.title("Scanner Companion")
         self.geometry(NORMAL_SIZE)
         self.resizable(False, False)
@@ -408,6 +422,9 @@ class ScannerApp(ctk.CTk):
 
         help_menu = self._make_menu()
         help_menu.add_command(label="Check for Updates...", command=lambda: self.check_for_updates(silent=False))
+        if with_status:
+            help_menu.add_command(label="🩺 Test Connection...", command=self._test_connection)
+        help_menu.add_command(label="📄 Open Log Folder", command=self._open_log_folder)
         help_menu.add_separator()
         help_menu.add_command(label="📖 View Setup Guide", command=self._open_setup_guide)
         help_menu.add_command(label="🔌 Troubleshoot Connection...", command=self._show_troubleshooting_wizard)
@@ -737,30 +754,43 @@ class ScannerApp(ctk.CTk):
                 elif kind == "photo_uploaded":
                     if self._widget_alive("photo_browser"):
                         self.photo_browser.on_uploaded(port, payload)
+                elif kind == "test_result":
+                    self._testing = False
+                    if self._widget_alive("status_label"):
+                        self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
+                    self.after(50, lambda t=payload: messagebox.showinfo("Connection test", t))
         except queue.Empty:
             pass
         finally:
             self._poll_job = self.after(100, self._poll_queue)
 
     def _periodic_flush(self):
-        """Every 20s, try to drain the offline scan queue -- catches the
-        case where connectivity comes back but nobody scans anything for
-        a while, so queued check-ins/outs don't just sit there untouched."""
         try:
             flushed = self.db.flush_pending_scans()
             if flushed:
+                log.info("Synced %d queued scan(s)", flushed)
                 self._log(f"✅ Synced {flushed} queued scan(s) that were waiting on a connection.")
+        except Exception as e:
+            log.debug("Queued scan sync still failing: %s", e)
+        try:
+            self._retry_pending_photos()
+            self._update_pending_label()
         except Exception:
-            pass  # still offline, or a transient issue -- just try again next cycle
-        self._update_pending_label()
-        self._flush_job = self.after(20000, self._periodic_flush)
+            log.exception("Periodic sync error")
+        finally:
+            self._flush_job = self.after(20000, self._periodic_flush)   # always reschedule
 
     def _update_pending_label(self):
-        if not hasattr(self, "pending_label") or not self.pending_label.winfo_exists():
+        if not self._widget_alive("pending_label"):
             return
-        count = self.db.pending_count()
-        if count:
-            self.pending_label.config(text=f"⏳ {count} queued (offline)", fg=COLORS["warning"])
+        parts = []
+        scans, photos = self.db.pending_count(), self._pending_photo_count()
+        if scans:
+            parts.append(f"⏳ {scans} scan(s) queued")
+        if photos:
+            parts.append(f"📷 {photos} photo(s) waiting")
+        if parts:
+            self.pending_label.config(text="   ".join(parts), fg=COLORS["warning"])
         else:
             self.pending_label.config(text="", fg=COLORS["text_muted"])
 
@@ -904,6 +934,7 @@ class ScannerApp(ctk.CTk):
                 DriveStore(),
                 on_uploaded=lambda sid, subj: self.scan_queue.put(("photo_uploaded", sid, subj)),
             )
+            self._retry_pending_photos(force=True)
             return True
         except Exception as e:
             messagebox.showerror("Photo Capture", f"Couldn't connect to Google Drive:\n{e}")
@@ -1005,6 +1036,116 @@ class ScannerApp(ctk.CTk):
                 self._log(f"Camera error: {e}")
 
         next_subject()
+
+
+    def _on_tk_error(self, exc, val, tb):
+        """Any error inside a button/timer callback: log it, tell the user once a minute, keep running."""
+        log.error("Unhandled error in UI callback", exc_info=(exc, val, tb))
+        if time.monotonic() - self._last_error_dialog > 60:   # polling loops can fail repeatedly
+            self._last_error_dialog = time.monotonic()
+            try:
+                messagebox.showerror(
+                    "Something went wrong",
+                    "An unexpected error happened and was written to the log. The app will keep running.\n\n"
+                    "If it keeps happening, use Help > Open Log Folder and send the newest file to support.")
+            except Exception:
+                pass
+
+    def _open_log_folder(self):
+        try:
+            open_path(log_dir())
+        except Exception as e:
+            messagebox.showerror("Error", f"Couldn't open the log folder:\n{e}")
+
+    def _student_names(self, sid):
+        for s in self.db.get_students():
+            if str(s.get("s_id")) == str(sid):
+                return s.get("last_name", ""), s.get("first_name", "")
+        return None
+
+    def _pending_photo_count(self) -> int:
+        try:
+            return sum(1 for f in PENDING_PHOTOS_DIR.iterdir() if f.suffix.lower() == ".jpg")
+        except OSError:
+            return 0
+
+    def _retry_pending_photos(self, force=False):
+        if self.photo_worker is None or not self._pending_photo_count():
+            return
+        if not force and time.monotonic() - self._last_photo_retry < 300:   # at most every 5 minutes
+            return
+        self._last_photo_retry = time.monotonic()
+        try:
+            n = self.photo_worker.retry_pending(self._student_names)
+            if n:
+                self._log(f"📷 Retrying {n} photo(s) that couldn't upload earlier")
+        except Exception:
+            log.exception("Retrying pending photos failed")
+
+    def _test_connection(self):
+        if self._testing:
+            return
+        photo_checks = None
+        if self.db.photo_unlocked:
+            try:
+                from photo_capture import has_saved_login, test_camera
+                photo_checks = (has_saved_login, test_camera)
+            except Exception as e:
+                log.warning("Photo module unavailable: %s", e)
+        self._testing = True
+        if self._widget_alive("status_label"):
+            self.status_label.config(text="Testing connections...", fg=COLORS["text_muted"])
+        threading.Thread(target=self._run_connection_tests, args=(photo_checks,), daemon=True).start()
+
+    def _run_connection_tests(self, photo_checks):
+        lines = []
+
+        def check(label, fn):
+            t0 = time.monotonic()
+            try:
+                detail = fn()
+                lines.append(f"✅ {label}: {detail or 'OK'} ({time.monotonic() - t0:.1f}s)")
+            except Exception as e:
+                log.warning("Connection test failed - %s: %s", label, e)
+                lines.append(f"❌ {label}: {str(e)[:150]}")
+
+        def database():
+            (self.db.client.table("students").select("s_id")
+             .eq("center_id", self.db.center_id).limit(1).execute())
+
+        def updates():
+            requests.get(MANIFEST_URL, timeout=5).raise_for_status()
+
+        def scanners():
+            bad = [f"{p} ({s})" for p, s in self.port_statuses.items() if s != "connected"]
+            if bad:
+                raise RuntimeError("not connected: " + ", ".join(bad))
+            return f"{len(self.port_statuses)} connected"
+
+        check("Database (Supabase)", database)
+        check("Update server", updates)
+        check("Barcode scanners", scanners)
+
+        if photo_checks:
+            has_saved_login, test_camera = photo_checks
+
+            def drive():
+                if self.photo_worker is None:
+                    return "signed in" if has_saved_login() else "not connected yet (signs in when Photo Mode is first used)"
+                store = self.photo_worker.store
+                store.list_children(store.root_id, folders_only=True)
+
+            def camera():
+                if self._photo_busy:
+                    return "in use right now (skipped)"
+                if not test_camera(self.db.camera_index):
+                    raise RuntimeError("no image from the selected camera")
+
+            check("Google Drive", drive)
+            check("Camera", camera)
+
+        lines.append(f"ℹ️ Waiting to sync: {self.db.pending_count()} scan(s), {self._pending_photo_count()} photo(s)")
+        self.scan_queue.put(("test_result", "", "\n".join(lines)))
 
     def _choose_camera(self):
         if self._photo_busy:
@@ -1438,5 +1579,11 @@ class ScannerApp(ctk.CTk):
 
 
 if __name__ == "__main__":
-    app = ScannerApp()
-    app.mainloop()
+    setup_logging()
+    log.info("Scanner Companion %s starting", CURRENT_VERSION)
+    try:
+        app = ScannerApp()
+        app.mainloop()
+    except Exception:
+        log.exception("Fatal error")
+        raise

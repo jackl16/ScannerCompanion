@@ -41,6 +41,9 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from google.auth.exceptions import RefreshError
 
+import logging
+log = logging.getLogger("photos")
+
 DEFAULT_THEME = {
     "colors": {"bg": "#121214", "card": "#1a1a1e", "border": "#27272a", "text": "#f4f4f5",
                "text_muted": "#a1a1aa", "primary": "#4f46e5", "primary_light": "#DBEAFE",
@@ -114,6 +117,14 @@ def disconnect_google() -> None:
 
 KR_SERVICE, KR_USER = "ScannerCompanion", "google-drive"
 
+
+def test_camera(index) -> bool:
+    cam = _open_camera(index)
+    try:
+        return bool(cam.isOpened() and cam.read()[0])
+    finally:
+        cam.release()
+
 def _open_camera(index):
     backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
     return cv2.VideoCapture(index, backend)
@@ -179,13 +190,14 @@ class DriveStore:
         with self._lock:
             return self._upload(*args, **kwargs)
 
-    def _upload(self, student_id, last, first, subject, jpeg, barcode=None):
+    def _upload(self, student_id, last, first, subject, jpeg, barcode=None, taken_at=None):
         """Saves to <root>/<First, Last (ID)>/<subject>/ and keeps only the newest N photos per subject."""
         try:
             label = student_id
             student = self._find_or_create(f"student:{student_id}", f"{first}, {last} ({label})", self.root_id)
             folder = self._find_or_create(f"student:{student_id}:{subject}", subject, student)
-            name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".jpg"
+            stamp = datetime.fromtimestamp(taken_at) if taken_at else datetime.now()
+            name = stamp.strftime("%Y-%m-%d_%H-%M-%S") + ".jpg"
             media = MediaIoBaseUpload(io.BytesIO(jpeg), mimetype="image/jpeg")
             self.svc.files().create(body={"name": name, "parents": [folder]}, media_body=media, fields="id").execute()
             files = self.svc.files().list(q=f"'{folder}' in parents and trashed=false",
@@ -562,40 +574,90 @@ class UploadWorker(threading.Thread):
         self.store = store
         self.on_uploaded = on_uploaded
         self.q = queue.Queue()
+        self._queued_paths = set()   # pending files already waiting in the queue
         self.start()
 
     def submit(self, student_id, last, first, subject, jpeg, barcode=None):
-        self.q.put((student_id, last, first, subject, jpeg, barcode))
+        self.q.put((student_id, last, first, subject, jpeg, barcode, time.time(), None))
 
     def stop(self):
-        self.q.put(None)   # sentinel: finish anything already queued, then exit
+        self.q.put(None)   # finish what's queued, then exit
+
+    def retry_pending(self, lookup_names):
+        """Queues photos saved by earlier failed uploads. lookup_names(student_id) -> (last, first) or None.
+        Files are only deleted after a successful upload. Returns how many were queued."""
+        if not os.path.isdir(PENDING_DIR):
+            return 0
+        n = 0
+        for fn in sorted(os.listdir(PENDING_DIR)):
+            path = os.path.join(PENDING_DIR, fn)
+            if not fn.lower().endswith(".jpg") or path in self._queued_paths:
+                continue
+            try:
+                sid, rest = fn[:-4].split("_", 1)           # <student id>_<subject>_<unix time>.jpg
+                subject, ts = rest.rsplit("_", 1)
+                names = lookup_names(sid)
+                if names is None:
+                    continue                                  # unknown student: leave the file alone
+                last, first = names
+                taken_at = int(ts)
+            except Exception:
+                log.warning("Skipping unrecognised pending file: %s", fn)
+                continue
+            self._queued_paths.add(path)
+            self.q.put((sid, last, first, subject, None, None, taken_at, path))   # jpeg read in the worker
+            n += 1
+        if n:
+            log.info("Queued %d pending photo(s) for retry", n)
+        return n
 
     def run(self):
         while True:
             job = self.q.get()
-            if job is None:
+            try:
+                if job is None:
+                    return
+                self._handle(job)
+            except Exception:
+                log.exception("Photo upload job crashed")
+            finally:
                 self.q.task_done()
+
+    def _handle(self, job):
+        sid, last, first, subject, jpeg, barcode, taken_at, src = job
+        if jpeg is None:
+            with open(src, "rb") as f:
+                jpeg = f.read()
+        for attempt in range(3):
+            try:
+                self.store.upload(sid, last, first, subject, jpeg, barcode, taken_at)
+                log.info("Uploaded %s photo for student %s", subject, sid)
+                if src:
+                    self._queued_paths.discard(src)
+                    try:
+                        os.remove(src)
+                    except OSError as e:
+                        log.warning("Couldn't delete %s: %s", src, e)
+                if self.on_uploaded:
+                    try:
+                        self.on_uploaded(sid, subject)
+                    except Exception:
+                        pass
                 return
-            for attempt in range(3):
-                try:
-                    self.store.upload(*job)
-                    print(f"uploaded {job[3]} photo for {job[0]}")
-                    if self.on_uploaded:
-                        try:
-                            self.on_uploaded(job[0], job[3])  # student id, subject
-                        except Exception:
-                            pass
-                    break
-                except Exception as e:
-                    print(f"upload failed ({e}); retry {attempt + 1}/3")
+            except Exception as e:
+                log.warning("Upload failed (student %s, %s) attempt %d/3: %s", sid, subject, attempt + 1, e)
+                if attempt < 2:
                     time.sleep(2 ** attempt * 2)
-            else:  # all retries failed: keep the photo on disk instead of losing it
-                os.makedirs(PENDING_DIR, exist_ok=True)
-                path = os.path.join(PENDING_DIR, f"{job[0]}_{job[3]}_{int(time.time())}.jpg")
-                with open(path, "wb") as f:
-                    f.write(job[4])
-                print("saved locally:", path)
-            self.q.task_done()
+
+        if src:   # already on disk from an earlier failure: leave it for the next retry
+            self._queued_paths.discard(src)
+            log.error("Retry failed for %s; will try again later", os.path.basename(src))
+        else:     # first failure: keep the photo instead of losing it
+            os.makedirs(PENDING_DIR, exist_ok=True)
+            path = os.path.join(PENDING_DIR, f"{sid}_{subject}_{int(taken_at)}.jpg")
+            with open(path, "wb") as f:
+                f.write(jpeg)
+            log.error("Saved photo locally after 3 failures: %s", path)
 
 
 def _is_yes(v):
