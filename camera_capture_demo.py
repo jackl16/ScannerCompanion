@@ -1,5 +1,5 @@
 """
-photo_capture.py - prototype: scan a student -> photograph book pages -> per-student Google Drive folder.
+camera_capture_demo.py - prototype: scan a student -> photograph book pages -> per-student Google Drive folder.
 
 Setup
   pip install opencv-python pillow supabase tomli google-api-python-client google-auth-oauthlib
@@ -8,7 +8,7 @@ Setup
   and save it as credentials.json next to this file.
   First run opens a browser to log in as the Google account that should own the photos.
 
-Run the demo:  python photo_capture.py
+Run the demo:  python camera_capture_demo.py
 Integrate:     import DriveStore, UploadWorker, PhotoDialog; open a PhotoDialog from the Tk main thread
                when a scan arrives (see the demo at the bottom for the queue hand-off).
 """

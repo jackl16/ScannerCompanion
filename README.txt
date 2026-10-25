@@ -19,7 +19,7 @@ The application is completely self-contained. You do not need to install any add
 
 ### Checking Connection Health
 
-* Look at the **Status Bar** running along the very bottom row of the application window.
+* Look at the **Status Bar** running along the top of the application window.
 * **✅ Connected**: The application has successfully claimed your USB hardware slots and is ready to process student workpacks.
 * **… Processing**: A barcode was read and the system is communicating securely with the cloud servers.
 * **❌ Disconnected**: Connection lost. Check your scanner cables or restart the tool.
@@ -32,7 +32,7 @@ The application is completely self-contained. You do not need to install any add
 ### Hardware Troubleshooting Checklist
 ** Hardware Scanners MUST have a 'COM' mode, 'HID/Keyboard' mode scanners will NOT work.**
 
-If your physical barcode reader isn't registering scans or the bottom bar shows a red "❌", follow these simple steps to try to fix the issue(s): 
+If your physical barcode reader isn't registering scans or the top bar shows a red error, follow these simple steps to try to fix the issue(s): 
 
 1. **The 3-Second Rule**: Unplug the scanner's USB cable from the back of the computer tower, wait 3 seconds, and plug it back into a different USB slot.
 2. **Re-Detect Scanner**: In the top menu layout bar, click **Settings -> Detect Scanner** to force the app background threads to scan for hardware.

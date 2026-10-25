@@ -43,7 +43,7 @@ LOCAL_TZ = ZoneInfo("America/Edmonton")  # match the Streamlit app's timezone
 TOKEN_REFRESH_INTERVAL_SECONDS = 30 * 60  # refresh well before Supabase's ~1hr token expiry
 
 STAFF_CODE_PATTERN = re.compile(r"^S\d{5}$")
-PHOTO_HIDDEN_STATUSES = {"withdrawn"}
+PHOTO_HIDDEN_STATUSES = {"withdrawn", "inactive"}
 
 # Substrings that show up in exceptions caused by *connectivity* problems
 # (no internet, DNS hiccup, request timeout, etc.) as opposed to a genuine
@@ -68,6 +68,11 @@ INVALID_TOKEN_MARKERS = (
     "session_not_found", "user_not_found",
 )
 
+import keyring
+from keyring.errors import PasswordDeleteError
+
+KR_SERVICE, KR_SESSION = "ScannerCompanion", "supabase-session"
+
 
 class AuthError(Exception):
     """Raised when the configured scanner account can't sign in."""
@@ -82,17 +87,7 @@ def load_config() -> dict:
         )
     with open(CONFIG_PATH, "rb") as f:
         return tomllib.load(f)
-    # --- AUTOMATED CREDENTIALS OBFUSCATION ---    
-    if "scanner" in config and "password" in config["scanner"]:
-        try:
-            encoded_pw = config["scanner"]["password"]
-            # Decode the base64 string back into standard human-readable text
-            decoded_bytes = base64.b64decode(encoded_pw.encode("utf-8"))
-            config["scanner"]["password"] = decoded_bytes.decode("utf-8")
-        except Exception:
-            # Fall back gracefully if the password string isn't encoded yet
-            pass
-    return config
+
 
 def save_config(config: dict) -> None:
     export_config = copy.deepcopy(config)
@@ -124,10 +119,19 @@ class ScannerDB:
         self.baud_rate = scanner_cfg.get("baud_rate", 9600)
         self.debounce_seconds = scanner_cfg.get("debounce_seconds", 3)
         self.sound_enabled = scanner_cfg.get("sound_enabled", False)
+        self.scanner_skipped = bool(scanner_cfg.get("skipped", False))
         
         features_cfg = config.get("features", {})
         self.photo_unlocked = bool(features_cfg.get("drive_photos", False))
         self.photo_mode = self.photo_unlocked and bool(features_cfg.get("photo_mode", False))
+        self.stale_warn_days = int(features_cfg.get("stale_warn_days", 14))
+        self.stale_bad_days = int(features_cfg.get("stale_bad_days", 28))
+
+        appearance_cfg = config.get("appearance", {})
+        self.log_pills = bool(appearance_cfg.get("log_pills", False))
+        self.log_terminal = bool(appearance_cfg.get("log_terminal", False))
+
+        self.camera_index = int(config.get("camera", {}).get("index", 0))
 
         self._last_scan_id = None
         self._last_scan_time = 0
@@ -174,14 +178,16 @@ class ScannerDB:
         exception at all was wiping the file, even ones that had nothing
         to do with the token itself.
         """
-        if not SESSION_FILE.exists():
+        try:
+            raw = keyring.get_password(KR_SERVICE, KR_SESSION)
+        except Exception:
+            raw = None
+        if not raw:
             return False
 
         try:
-            saved = json.loads(SESSION_FILE.read_text())
-            refresh_token = saved["refresh_token"]
+            refresh_token = json.loads(raw)["refresh_token"]
         except Exception:
-            # the file itself is corrupt/unreadable -- nothing to restore
             self.forget_remembered_session()
             return False
 
@@ -241,10 +247,15 @@ class ScannerDB:
                 pass
 
     def remember_session(self, refresh_token: str):
-        SESSION_FILE.write_text(json.dumps({"refresh_token": refresh_token}))
+        keyring.set_password(KR_SERVICE, KR_SESSION, json.dumps({"refresh_token": refresh_token}))
+
 
     def forget_remembered_session(self):
-        if SESSION_FILE.exists():
+        try:
+            keyring.delete_password(KR_SERVICE, KR_SESSION)
+        except PasswordDeleteError:
+            pass
+        if SESSION_FILE.exists():          # clean up the old plain file from earlier versions
             SESSION_FILE.unlink()
 
     def _finish_login(self, session) -> bool:
@@ -294,13 +305,20 @@ class ScannerDB:
 
     # --- scanner config ---
 
-    def save_serial_ports(self, ports: list) -> None:
-        """Persists the detected scanner port(s) into scanner_config.toml,
-        preserving every other existing setting in the file."""
+    def save_scanner_skipped(self, skipped: bool) -> None:
         config = load_config()
-        config.setdefault("scanner", {})["ports"] = ports
+        config.setdefault("scanner", {})["skipped"] = skipped
         save_config(config)
-        self.serial_ports = ports  # keep the in-memory copy in sync too
+        self.scanner_skipped = skipped
+
+    def save_serial_ports(self, ports: list) -> None:
+        config = load_config()
+        scanner = config.setdefault("scanner", {})
+        scanner["ports"] = ports
+        scanner["skipped"] = False          # a real scanner was set up, so stop skipping
+        save_config(config)
+        self.serial_ports = ports           # keep the in-memory copy in sync too
+        self.scanner_skipped = False
 
     def save_sound_enabled(self, enabled: bool) -> None:
         """Persists the Audio Feedback toggle so it survives app restarts
@@ -309,6 +327,12 @@ class ScannerDB:
         config.setdefault("scanner", {})["sound_enabled"] = enabled
         save_config(config)
         self.sound_enabled = enabled
+
+    def save_camera_index(self, index: int) -> None:
+        config = load_config()
+        config.setdefault("camera", {})["index"] = int(index)
+        save_config(config)
+        self.camera_index = int(index)
 
     # --- features ----
     def unlock_photo_feature(self) -> None:
@@ -322,6 +346,20 @@ class ScannerDB:
         config.setdefault("features", {})["photo_mode"] = enabled
         save_config(config)
         self.photo_mode = enabled
+
+    def save_stale_days(self, warn: int, bad: int) -> None:
+        config = load_config()
+        features = config.setdefault("features", {})
+        features["stale_warn_days"] = int(warn)
+        features["stale_bad_days"] = int(bad)
+        save_config(config)
+        self.stale_warn_days, self.stale_bad_days = int(warn), int(bad)
+
+    def save_log_style(self, pills: bool, terminal: bool) -> None:
+        config = load_config()
+        config.setdefault("appearance", {}).update({"log_pills": pills, "log_terminal": terminal})
+        save_config(config)
+        self.log_pills, self.log_terminal = pills, terminal
 
     # --- local time helpers ---
 
@@ -361,8 +399,11 @@ class ScannerDB:
 
     @staticmethod
     def is_withdrawn(student: dict) -> bool:
-        status = str(student.get("enrollment_status") or "").strip().lower()
-        return status in PHOTO_HIDDEN_STATUSES
+        """True for students the photo app should ignore (withdrawn or inactive)."""
+        for col in ("enrollment_status", "status"):
+            if str(student.get(col) or "").strip().lower() in PHOTO_HIDDEN_STATUSES:
+                return True
+        return False
 
     def search_students(self, query: str, limit: int = 50) -> list:
         terms = query.lower().replace(",", " ").split()
