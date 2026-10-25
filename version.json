@@ -1,5 +1,6 @@
 {
-  "version": "1.0.4",
-  "url": "https://github.com/jackl16/ScannerCompanion/releases/download/v1.0.4/ScannerCompanion.exe",
-  "changelog": "Remember me fixes, Token fixes, Offline scanning fixes, Version checking"
+  "version": "1.0.5",
+  "url": "https://github.com/jackl16/ScannerCompanion/releases/download/v1.0.5/ScannerCompanion.exe",
+  "changelog": "Updating testing",
+  "signature":"c3fac67f339a31473b368fc021191f21f58cfa9748ccbcf2e55f7cc38d32458a84d343dbb4f0af495444f273d9fd831860c6605a73372375d9a810d07e2a7c00"
 }
