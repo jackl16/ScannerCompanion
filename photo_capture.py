@@ -4,7 +4,7 @@ photo_capture.py - prototype: scan a student -> photograph book pages -> per-stu
 Setup
   pip install opencv-python pillow supabase tomli google-api-python-client google-auth-oauthlib
   Google Cloud console: create a project, enable the Google Drive API, configure the OAuth consent
-  screen (add your Google account as a test user), create an OAuth client of type "Desktop app",
+  screen (add Google account as a test user), create an OAuth client of type "Desktop app",
   and save it as credentials.json next to this file.
   First run opens a browser to log in as the Google account that should own the photos.
 
@@ -21,6 +21,7 @@ import tkinter as tk
 import subprocess
 import sys
 import tempfile
+import webbrowser
 from collections import OrderedDict
 
 from datetime import datetime
@@ -63,9 +64,14 @@ PENDING_DIR = os.path.join(BASE, "pending_photos")
 CREDS_FILE = os.path.join(BASE, "credentials.json")
 TOKEN_FILE = os.path.join(BASE, "token.json")
 
-# students table columns (adjust if yours differ)
+# students table columns 
 BARCODE_COL, FIRST_COL, LAST_COL = "barcode_code", "first_name", "last_name"
 MATH_COL, READING_COL = "math", "reading"  # a Y (or true) means the student does that subject
+
+LAST_KEY = "last_photo"   # appProperties key on each student folder, e.g. 2026-10-21T14:03:11
+SORT_OPTIONS = ["A–Z", "Longest ago", "Most recent"]
+STALE_WARN_DAYS = 4     # amber from here
+STALE_BAD_DAYS = 14     # red from here (and for "Never")
 
 import json
 import keyring
@@ -200,6 +206,10 @@ class DriveStore:
             name = stamp.strftime("%Y-%m-%d_%H-%M-%S") + ".jpg"
             media = MediaIoBaseUpload(io.BytesIO(jpeg), mimetype="image/jpeg")
             self.svc.files().create(body={"name": name, "parents": [folder]}, media_body=media, fields="id").execute()
+            try:
+                self._set_last_photo(student, stamp)
+            except Exception as e:   # never let this trigger a re-upload of the photo
+                log.warning("Couldn't stamp last-photo date: %s", e)
             files = self.svc.files().list(q=f"'{folder}' in parents and trashed=false",
                                           orderBy="createdTime desc", fields="files(id)").execute()["files"]
             for old in files[self.keep:]:
@@ -225,6 +235,44 @@ class DriveStore:
         """One API call: the file's bytes."""
         with self._lock:
             return self.svc.files().get_media(fileId=file_id).execute(num_retries=3)
+        
+    def _set_last_photo(self, student_folder, when):
+        """Keeps the newest date only, so retried older photos can't move it backwards."""
+        iso = when.strftime("%Y-%m-%dT%H:%M:%S")
+        cur = self.svc.files().get(fileId=student_folder, fields="appProperties").execute()
+        if (cur.get("appProperties") or {}).get(LAST_KEY, "") >= iso:
+            return
+        self.svc.files().update(fileId=student_folder,
+                                body={"appProperties": {LAST_KEY: iso}}).execute()
+
+    def backfill_last_photo(self, student_folder):
+        """One-time: finds the newest photo across a student's subject folders (by file name,
+        which is the timestamp), saves it on the folder, and returns it. None if no photos."""
+        newest = None
+        with self._lock:
+            subs = self.svc.files().list(
+                q=f"'{student_folder}' in parents and trashed=false and mimeType='{FOLDER_MIME}'",
+                fields="files(id)", pageSize=100).execute(num_retries=3).get("files", [])
+            for sub in subs:
+                hit = self.svc.files().list(
+                    q=f"'{sub['id']}' in parents and trashed=false and mimeType!='{FOLDER_MIME}'",
+                    orderBy="name desc", pageSize=1,
+                    fields="files(name)").execute(num_retries=3).get("files", [])
+                if not hit:
+                    continue
+                try:
+                    t = datetime.strptime(hit[0]["name"].rsplit(".", 1)[0], "%Y-%m-%d_%H-%M-%S")
+                except ValueError:
+                    continue
+                if newest is None or t > newest:
+                    newest = t
+            if newest:
+                self.svc.files().update(
+                    fileId=student_folder,
+                    body={"appProperties": {LAST_KEY: newest.strftime("%Y-%m-%dT%H:%M:%S")}}
+                ).execute()
+        return newest
+
 
 def _jpeg(frame):
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -435,6 +483,84 @@ class PhotoDialog(ctk.CTkToplevel):
         room = screen_h - 120 - int(210 * scale)                   # minus taskbar/title bar and the controls
         height = max(180, min(room, int(screen_h * 0.35), int(self.PREVIEW_W / aspect)))
         return int(height * aspect)
+
+class StaleDaysDialog(ctk.CTkToplevel):
+    """Small popup to set how many days old a student's last photo gets amber / red."""
+
+    def __init__(self, parent, warn, bad, on_save):
+        super().__init__(parent)
+        self.withdraw()
+        self.configure(fg_color=COLORS["bg"])
+        self.title("Photo Alert Days")
+        self.resizable(False, False)
+        self.on_save = on_save
+
+        card = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=16,
+                            border_width=1, border_color=COLORS["border"])
+        card.pack(fill="both", expand=True, padx=12, pady=12)
+        ctk.CTkLabel(card, text="Photo alert days", font=font(16, "bold"),
+                     text_color=COLORS["text"]).pack(padx=24, pady=(16, 2))
+        ctk.CTkLabel(card, text="Highlight students whose last photo is this old.",
+                     font=font(12), text_color=COLORS["text_muted"]).pack(padx=24, pady=(0, 12))
+
+        form = ctk.CTkFrame(card, fg_color="transparent")
+        form.pack(padx=24)
+
+        def row(label, color, value):
+            r = ctk.CTkFrame(form, fg_color="transparent")
+            r.pack(fill="x", pady=4)
+            ctk.CTkLabel(r, text=label, font=font(13), text_color=color,
+                         width=110, anchor="w").pack(side="left")
+            e = ctk.CTkEntry(r, width=70, height=34, corner_radius=8, font=font(13),
+                             justify="center", fg_color=COLORS["bg"], border_color=COLORS["border"])
+            e.insert(0, str(value))
+            e.pack(side="left", padx=(8, 8))
+            ctk.CTkLabel(r, text="days", font=font(12),
+                         text_color=COLORS["text_muted"]).pack(side="left")
+            return e
+
+        self.warn_entry = row("Amber after", COLORS["warning"], warn)
+        self.bad_entry = row("Red after", COLORS["error"], bad)
+        self.error = ctk.CTkLabel(card, text="", font=font(12), text_color=COLORS["error"])
+        self.error.pack(pady=(8, 0))
+
+        bar = ctk.CTkFrame(card, fg_color="transparent")
+        bar.pack(pady=(8, 16))
+        ctk.CTkButton(bar, text="Save", width=100, height=36, corner_radius=10,
+                      font=font(13, "bold"), fg_color=COLORS["primary"],
+                      hover_color=COLORS["primary_dark"], text_color=COLORS["on_primary"],
+                      command=self._save).pack(side="left", padx=5)
+        ctk.CTkButton(bar, text="Cancel", width=100, height=36, corner_radius=10,
+                      font=font(13), fg_color=COLORS["card_alt"], hover_color=COLORS["border"],
+                      text_color=COLORS["text"], command=self.destroy).pack(side="left", padx=5)
+
+        self.bind("<Return>", lambda e: self._save())
+        self.bind("<Escape>", lambda e: self.destroy())
+        center_over(self, parent)
+        self.transient(parent)
+        self.deiconify()
+        self.after(100, self._activate)
+
+    def _activate(self):
+        try:
+            self.lift()
+            self.focus_force()
+            self.warn_entry.focus()
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            warn, bad = int(self.warn_entry.get()), int(self.bad_entry.get())
+        except ValueError:
+            self.error.configure(text="Enter whole numbers only.")
+            return
+        if warn < 1 or bad <= warn:
+            self.error.configure(text="Amber must be 1 or more, and red must be later than amber.")
+            return
+        self.destroy()
+        self.on_save(warn, bad)
+
 
 class CameraPicker(ctk.CTkToplevel):
     """Cycles through connected cameras with a live preview; the user picks the one to use."""
@@ -696,8 +822,9 @@ class PhotoBrowser(ctk.CTkFrame):
     One API call per folder expanded and per photo opened. All Drive work runs on
     background threads and reports back through a queue polled on the Tk thread."""
 
-    def __init__(self, parent, get_store, get_visible_students):
+    def __init__(self, parent, get_store, get_visible_students,thresholds=(STALE_WARN_DAYS, STALE_BAD_DAYS)):
         super().__init__(parent, fg_color="transparent")
+        self.warn_days, self.bad_days = thresholds
         self.get_store = get_store                          # -> DriveStore or None
         self.get_visible_students = get_visible_students    # -> {s_id: "First Last (barcode)"}
         self.meta = {}                  # tree item id -> {"kind", "id", ...}
@@ -707,12 +834,21 @@ class PhotoBrowser(ctk.CTkFrame):
         self._selected = None
         self._loading = set()
         self._job = None
-        self._img = None
-        self._pil = None                 # full-size photo currently previewed
-        self._zoom = 1.0                 # 1.0 = fit to the box
+        self._imgs = [None, None]       # PhotoImage refs (Tk drops images without one)
+        self._pil = None                # full-size photo currently previewed
+        self._pil_id = None             # Drive id of self._pil
+        self._cmp_pil = None            # previous photo, while comparing
+        self._cmp_want = None
+        self._cmp_labels = ("", "")
+        self._zoom = 1.0                # 1.0 = fit to the box
         self._pan_x = self._pan_y = 0.0
         self._drag = None
-        
+        self._rows = []                 # (label, folder_id or None, student_id)
+        self._last = {}                 # student_id -> datetime of last photo
+        self._checking = set()          # student ids whose date is still being looked up
+        self._filter_text = ""
+        self.sort_var = tk.StringVar(value=SORT_OPTIONS[0])
+
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
@@ -727,10 +863,29 @@ class PhotoBrowser(ctk.CTkFrame):
         ctk.CTkButton(bar, text="Refresh", width=76, height=28, corner_radius=8, font=font(12),
                       fg_color=COLORS["card_alt"], hover_color=COLORS["border"],
                       text_color=COLORS["text"], command=self.refresh).pack(side="right")
+        ctk.CTkButton(bar, text="Open in Drive", width=104, height=28, corner_radius=8,
+                      font=font(12), fg_color=COLORS["card_alt"], hover_color=COLORS["border"],
+                      text_color=COLORS["text"], command=self._open_in_drive
+                      ).pack(side="right", padx=(0, 6))
+
+        ctk.CTkSegmentedButton(
+            left, values=SORT_OPTIONS, variable=self.sort_var, command=self._on_sort,
+            height=30, font=font(12), fg_color=COLORS["bg"],
+            selected_color=COLORS["primary"], selected_hover_color=COLORS["primary_dark"],
+            unselected_color=COLORS["bg"], unselected_hover_color=COLORS["border"],
+            text_color=COLORS["text"],
+        ).pack(fill="x", padx=12, pady=(8, 0))
+
+        self.filter_entry = ctk.CTkEntry(
+            left, height=30, corner_radius=8, font=font(12),
+            placeholder_text="Filter by name or barcode",
+            fg_color=COLORS["bg"], border_color=COLORS["border"])
+        self.filter_entry.pack(fill="x", padx=12, pady=(8, 0))
+        self.filter_entry.bind("<KeyRelease>", self._on_filter)
+
         tk.Frame(left, height=1, bg="#3f3f46").pack(fill="x", padx=12, pady=(10, 0))  # divider
 
         # footer status line: always present, so changing its text never moves anything.
-        # Packed from the bottom up: status first (lowest), then its divider, then the tree.
         self.status = StatusText(left, text="Click Refresh to load", size=11, anchor="w",
                                  wraplength=290)
         self.status.pack(side="bottom", fill="x", padx=14, pady=(4, 10))
@@ -738,8 +893,15 @@ class PhotoBrowser(ctk.CTkFrame):
 
         box = tk.Frame(left, bg=COLORS["card"])  # plain frame hosts the ttk tree + scrollbar
         box.pack(fill="both", expand=True, padx=(8, 4), pady=(6, 4))
-        self.tree = ttk.Treeview(box, show="tree", selectmode="browse")
-        self.tree.column("#0", width=290, stretch=True)
+        self.tree = ttk.Treeview(box, columns=("last",), show="tree headings",
+                                 selectmode="browse", height=6)
+        self.tree.heading("#0", text="Student", anchor="w")
+        self.tree.heading("last", text="Last photo", anchor="e")
+        scale = max(self.winfo_fpixels("1i") / 96, 1.0)
+        self.tree.column("#0", width=220, stretch=True)
+        self.tree.column("last", width=int(150 * scale), anchor="e", stretch=False)
+        self.tree.tag_configure("warn", foreground=COLORS["warning"])
+        self.tree.tag_configure("stale", foreground=COLORS["error"])
         sb = ctk.CTkScrollbar(box, command=self.tree.yview, width=12, fg_color=COLORS["card"],
                               button_color=COLORS["border"], button_hover_color=COLORS["text_muted"])
         self.tree.configure(yscrollcommand=sb.set)
@@ -764,19 +926,24 @@ class PhotoBrowser(ctk.CTkFrame):
         tools.pack(fill="x", padx=14, pady=(0, 12))
         btn_style = dict(height=34, corner_radius=8, font=font(12), fg_color=COLORS["card_alt"],
                          hover_color=COLORS["border"], text_color=COLORS["text"])
-        self.open_btn = ctk.CTkButton(tools, text="Open full size", text_color_disabled=COLORS["text_muted"],
-                                      state="disabled", command=self._open_selected, **{
-                                          **btn_style, "text_color": COLORS["text"]})
+        self.open_btn = ctk.CTkButton(tools, text="Full size", width=84, state="disabled",
+                                      text_color_disabled=COLORS["text_muted"],
+                                      command=self._open_selected, **btn_style)
         self.open_btn.pack(side="right")
-        ctk.CTkButton(tools, text="Fit", width=52, command=self._fit, **btn_style).pack(side="right", padx=(0, 8))
-        self.zoom_slider = ctk.CTkSlider(tools, from_=1.0, to=6.0, number_of_steps=50, width=160,
+        ctk.CTkButton(tools, text="Fit", width=48, command=self._fit,
+                      **btn_style).pack(side="right", padx=(0, 6))
+        self.compare_btn = ctk.CTkButton(tools, text="Compare", width=80, state="disabled",
+                                         text_color_disabled=COLORS["text_muted"],
+                                         command=self._toggle_compare, **btn_style)
+        self.compare_btn.pack(side="right", padx=(0, 6))
+        self.zoom_slider = ctk.CTkSlider(tools, from_=1.0, to=6.0, number_of_steps=50, width=90,
                                          progress_color=COLORS["primary"],
                                          command=lambda v: self._zoom_at(float(v)))
         self.zoom_slider.set(1.0)
         self.zoom_slider.pack(side="left")
-        self.zoom_label = ctk.CTkLabel(tools, text="1.0×", width=44, font=font(12, "bold"),
+        self.zoom_label = ctk.CTkLabel(tools, text="1.0×", width=40, font=font(12, "bold"),
                                        text_color=COLORS["text"])
-        self.zoom_label.pack(side="left", padx=(8, 0))
+        self.zoom_label.pack(side="left", padx=(6, 0))
 
         self.canvas.bind("<Configure>", lambda e: self._render())
         self.canvas.bind("<MouseWheel>", self._on_wheel)
@@ -835,18 +1002,28 @@ class PhotoBrowser(ctk.CTkFrame):
         self._run(self._fetch_root, store, visible)
 
     def _fetch_root(self, store, visible):
-        rows = []
+        rows, last, missing, seen = [], {}, [], set()
         for f in store.list_children(store.root_id, folders_only=True):
-            key = (f.get("appProperties") or {}).get("kt_key", "").split(":")
+            props = f.get("appProperties") or {}
+            key = props.get("kt_key", "").split(":")
             if len(key) == 2 and key[0] == "student" and key[1] in visible:
-                rows.append((visible[key[1]], f["id"], key[1]))
-        rows.sort(key=lambda r: r[0].lower())
-        return ("root", rows)
+                sid = key[1]
+                seen.add(sid)
+                rows.append((visible[sid], f["id"], sid))
+                dt = self._parse_last(props.get(LAST_KEY))
+                if dt:
+                    last[sid] = dt
+                else:
+                    missing.append((sid, f["id"]))
+        for sid, label in visible.items():      # no Drive folder yet = never photographed
+            if sid not in seen:
+                rows.append((label, None, sid))
+        return ("root", rows, last, missing)
 
     def _on_open(self, event):
         iid = self.tree.focus()
         meta = self.meta.get(iid)
-        if not meta or meta["kind"] == "photo" or iid in self._loading:
+        if not meta or meta["kind"] not in ("student", "subject") or iid in self._loading:
             return
         store = self.get_store()
         if store is None:
@@ -867,6 +1044,7 @@ class PhotoBrowser(ctk.CTkFrame):
         meta = self.meta.get(sel[0]) if sel else None
         if not (meta and meta["kind"] == "photo"):
             return
+        self._leave_compare_state()
         subject_iid = self.tree.parent(sel[0])
         student_iid = self.tree.parent(subject_iid)
         self.caption.configure(text=f"{self.tree.item(student_iid, 'text')}   •   "
@@ -874,6 +1052,7 @@ class PhotoBrowser(ctk.CTkFrame):
                                     f"{self.tree.item(sel[0], 'text')}")
         self._selected = meta["id"]
         self.open_btn.configure(state="normal")
+        self.compare_btn.configure(state="normal")
         self._show_photo(meta["id"], external=False)
 
     def _open_selected(self):
@@ -906,11 +1085,26 @@ class PhotoBrowser(ctk.CTkFrame):
     def _handle(self, msg):
         kind = msg[0]
         if kind == "root":
-            for label, fid, sid in msg[1]:
-                iid = self.tree.insert("", "end", text=label)
-                self.meta[iid] = {"kind": "student", "id": fid, "student_id": sid}
-                self.tree.insert(iid, "end", text="Loading...")
-            self.status.config(text=f"{len(msg[1])} students with photos")
+            _, self._rows, self._last, missing = msg
+            store = self.get_store() if missing else None
+            self._checking = {sid for sid, _ in missing} if store is not None else set()
+            self._populate_root()
+            if store is not None:
+                self.status.config(text="Loading photo dates...")
+                threading.Thread(target=self._backfill, args=(store, missing), daemon=True).start()
+            else:
+                self.status.config(text=self._count_text())
+        elif kind == "last":
+            _, sid, dt = msg
+            self._checking.discard(sid)
+            if dt:
+                self._last[sid] = dt
+            self._refresh_row(sid)
+        elif kind == "backfill_done":
+            self._checking.clear()
+            self.status.config(text=self._count_text())
+            if self.sort_var.get() != SORT_OPTIONS[0]:
+                self._populate_root()           # dates just arrived, so re-sort
         elif kind == "children":
             _, iid, items = msg
             self._loading.discard(iid)
@@ -936,6 +1130,14 @@ class PhotoBrowser(ctk.CTkFrame):
                 self._cache.popitem(last=False)
             self._deliver(fid, data, external)
             self.status.config(text="")
+        elif kind == "cmp":
+            _, fid, data = msg
+            self._cache[fid] = data
+            while len(self._cache) > 30:
+                self._cache.popitem(last=False)
+            if fid == self._cmp_want:
+                self._set_compare(data)
+            self.status.config(text="")
         elif kind == "error":
             self._loading.clear()
             self.status.config(text=f"Error: {msg[1]}")
@@ -948,6 +1150,7 @@ class PhotoBrowser(ctk.CTkFrame):
             _open_external(path)
         elif fid == self._want:
             self._pil = Image.open(io.BytesIO(data)).convert("RGB")
+            self._pil_id = fid
             self._fit()
 
     def _is_open(self, iid):
@@ -955,8 +1158,12 @@ class PhotoBrowser(ctk.CTkFrame):
 
     def on_uploaded(self, student_id, subject):
         """A photo finished uploading: refresh only the folder the user could be looking at."""
-        student_iid = next((i for i, m in self.meta.items()
-                            if m["kind"] == "student" and m.get("student_id") == str(student_id)), None)
+        sid = str(student_id)
+        self._last[sid] = datetime.now()
+        self._checking.discard(sid)
+        student_iid = self._student_iid(sid)
+        self._refresh_row(sid)      # updates the date text and the amber/red color
+
         if student_iid is None:
             if self.tree.get_children():  # list is loaded and this student's folder is brand new
                 self.refresh()
@@ -976,6 +1183,11 @@ class PhotoBrowser(ctk.CTkFrame):
             self._loading.add(student_iid)  # first photo for this subject: its folder is new
             self._run(self._fetch_children, store, student_iid, self.meta[student_iid])
 
+    def apply_thresholds(self, warn, bad):
+        self.warn_days, self.bad_days = warn, bad
+        for iid, m in self.meta.items():
+            if m["kind"] in ("student", "nophotos"):
+                self.tree.item(iid, tags=self._tag_for(m["student_id"]))
 
     @staticmethod
     def _pretty_time(name):
@@ -997,21 +1209,40 @@ class PhotoBrowser(ctk.CTkFrame):
             c.create_text(cw // 2, ch // 2, text="Select a photo to preview it here",
                           fill=COLORS["text_muted"], font=(FONT, 12))
             return
-        iw, ih = self._pil.size
-        scale = min(cw / iw, ch / ih) * self._zoom
+        if self._cmp_pil is None:
+            self._pan_x, self._pan_y = self._draw_pane(self._pil, 0, cw, ch, 0)
+            return
+        half = cw // 2
+        self._draw_pane(self._cmp_pil, 0, half, ch, 1)
+        self._pan_x, self._pan_y = self._draw_pane(self._pil, half, cw - half, ch, 0)
+        c.create_line(half, 0, half, ch, fill="#3f3f46", width=2)
+        for x, text in ((6, self._cmp_labels[0]), (half + 6, self._cmp_labels[1])):
+            t = c.create_text(x + 6, 10, text=text, anchor="nw", fill="#ffffff",
+                              font=(FONT, 9, "bold"))
+            bb = c.bbox(t)
+            r = c.create_rectangle(bb[0] - 4, bb[1] - 2, bb[2] + 4, bb[3] + 2,
+                                   fill="#000000", outline="")
+            c.tag_lower(r, t)
+
+    def _draw_pane(self, pil, x0, pw, ch, slot):
+        """Draws one photo into a pw-wide strip of the canvas; returns its clamped pan."""
+        iw, ih = pil.size
+        scale = min(pw / iw, ch / ih) * self._zoom
         dw, dh = iw * scale, ih * scale
-        mx, my = max(0.0, (dw - cw) / 2), max(0.0, (dh - ch) / 2)   # can't drag the photo off-screen
-        self._pan_x = max(-mx, min(mx, self._pan_x))
-        self._pan_y = max(-my, min(my, self._pan_y))
-        ox = cw / 2 + self._pan_x - dw / 2      # top-left of the photo on the canvas
-        oy = ch / 2 + self._pan_y - dh / 2
-        vx0, vy0 = max(0.0, -ox), max(0.0, -oy)  # visible part, in display pixels
-        vx1, vy1 = min(dw, cw - ox), min(dh, ch - oy)
-        box = (max(0.0, vx0 / scale), max(0.0, vy0 / scale), min(iw, vx1 / scale), min(ih, vy1 / scale))
+        mx, my = max(0.0, (dw - pw) / 2), max(0.0, (dh - ch) / 2)   # can't drag off-screen
+        px = max(-mx, min(mx, self._pan_x))
+        py = max(-my, min(my, self._pan_y))
+        ox = pw / 2 + px - dw / 2
+        oy = ch / 2 + py - dh / 2
+        vx0, vy0 = max(0.0, -ox), max(0.0, -oy)
+        vx1, vy1 = min(dw, pw - ox), min(dh, ch - oy)
+        box = (max(0.0, vx0 / scale), max(0.0, vy0 / scale),
+               min(iw, vx1 / scale), min(ih, vy1 / scale))
         size = (max(1, round(vx1 - vx0)), max(1, round(vy1 - vy0)))
-        # only the visible part is resized, so dragging stays smooth even at high zoom
-        self._img = ImageTk.PhotoImage(self._pil.resize(size, Image.BILINEAR, box=box))
-        c.create_image(round(ox + vx0), round(oy + vy0), image=self._img, anchor="nw")
+        self._imgs[slot] = ImageTk.PhotoImage(pil.resize(size, Image.BILINEAR, box=box))
+        self.canvas.create_image(x0 + round(ox + vx0), round(oy + vy0),
+                                 image=self._imgs[slot], anchor="nw")
+        return px, py
 
     def _zoom_at(self, new_zoom, px=None, py=None):
         """Zoom toward a point (the cursor), or the centre if none is given."""
@@ -1019,15 +1250,16 @@ class PhotoBrowser(ctk.CTkFrame):
             return
         new_zoom = max(1.0, min(6.0, new_zoom))
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        px = cw / 2 if px is None else px
+        pw = cw // 2 if self._cmp_pil is not None else cw
+        px = pw / 2 if px is None else px % pw
         py = ch / 2 if py is None else py
         iw, ih = self._pil.size
-        fit = min(cw / iw, ch / ih)
+        fit = min(pw / iw, ch / ih)
         old, new = fit * self._zoom, fit * new_zoom
-        ox = cw / 2 + self._pan_x - iw * old / 2
+        ox = pw / 2 + self._pan_x - iw * old / 2
         oy = ch / 2 + self._pan_y - ih * old / 2
-        u, v = (px - ox) / old, (py - oy) / old          # photo point under the cursor
-        self._pan_x = px - u * new - cw / 2 + iw * new / 2
+        u, v = (px - ox) / old, (py - oy) / old
+        self._pan_x = px - u * new - pw / 2 + iw * new / 2
         self._pan_y = py - v * new - ch / 2 + ih * new / 2
         self._zoom = new_zoom
         self.zoom_slider.set(new_zoom)
@@ -1051,3 +1283,158 @@ class PhotoBrowser(ctk.CTkFrame):
             x0, y0, px, py = self._drag
             self._pan_x, self._pan_y = px + e.x - x0, py + e.y - y0
             self._render()
+    # dates and sort
+    @staticmethod
+    def _parse_last(s):
+        try:
+            return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _ago(dt):
+        if dt is None:
+            return "—"
+        d = (datetime.now().date() - dt.date()).days
+        when = "today" if d <= 0 else f"{d}d ago"
+        return f"{dt:%b %d}  ·  {when}"
+
+    def _student_iid(self, sid):
+        return next((i for i, m in self.meta.items()
+                     if m["kind"] == "student" and m.get("student_id") == str(sid)), None)
+
+    def _on_sort(self, _choice=None):
+        self._populate_root()
+
+    def _populate_root(self):
+        mode = self.sort_var.get()
+        terms = self._filter_text.split()
+        rows = [r for r in self._rows if all(t in r[0].lower() for t in terms)]
+
+        def last_of(r):
+            return self._last.get(r[2])
+
+        if mode == SORT_OPTIONS[1]:      # longest ago: never first, then oldest to newest
+            rows.sort(key=lambda r: (last_of(r) is not None, last_of(r) or datetime.min, r[0].lower()))
+        elif mode == SORT_OPTIONS[2]:    # most recent: newest first, never last
+            rows.sort(key=lambda r: (last_of(r) is None,
+                                     -last_of(r).timestamp() if last_of(r) else 0, r[0].lower()))
+        else:
+            rows.sort(key=lambda r: r[0].lower())
+
+        self.tree.delete(*self.tree.get_children())
+        self.meta.clear()
+        self._loading.clear()
+        for label, fid, sid in rows:
+            iid = self.tree.insert("", "end", text=label, values=(self._ago_for(sid),),
+                                   tags=self._tag_for(sid))
+            if fid:
+                self.meta[iid] = {"kind": "student", "id": fid, "student_id": sid}
+                self.tree.insert(iid, "end", text="Loading...")
+            else:
+                self.meta[iid] = {"kind": "nophotos", "id": None, "student_id": sid}
+        if not rows and self._rows:
+            self.tree.insert("", "end", text="No students match")
+
+    def _on_filter(self, _event=None):
+        text = self.filter_entry.get().strip().lower()
+        if text != self._filter_text:        # ignore Shift/Tab/arrow key releases
+            self._filter_text = text
+            self._populate_root()
+
+    def _ago_for(self, sid):
+        if sid in self._last:
+            return self._ago(self._last[sid])
+        return "…" if sid in self._checking else "Never"
+
+    def _tag_for(self, sid):
+        dt = self._last.get(sid)
+        if dt is None:
+            return () if sid in self._checking else ("stale",)
+        days = (datetime.now().date() - dt.date()).days
+        if days >= self.bad_days:
+            return ("stale",)
+        if days >= self.warn_days:
+            return ("warn",)
+        return ()
+
+    def _refresh_row(self, sid):
+        iid = self._student_iid(sid)
+        if iid is not None:
+            self.tree.item(iid, values=(self._ago_for(sid),), tags=self._tag_for(sid))
+
+    def _count_text(self):
+        never = sum(1 for _, _, sid in self._rows if sid not in self._last)
+        return f"{len(self._rows)} students  ·  {never} never photographed"
+
+    def _open_in_drive(self):
+        sel = self.tree.selection()
+        meta = self.meta.get(sel[0]) if sel else None
+        if not meta or not meta.get("id"):
+            self.status.config(text="Select a student, subject or photo that's in Drive")
+            return
+        if meta["kind"] == "photo":
+            webbrowser.open(f"https://drive.google.com/file/d/{meta['id']}/view")
+        else:
+            webbrowser.open(f"https://drive.google.com/drive/folders/{meta['id']}")
+
+    def _backfill(self, store, missing):
+        for sid, fid in missing:
+            try:
+                self._q.put(("last", sid, store.backfill_last_photo(fid)))
+            except Exception as e:
+                log.warning("Date backfill failed for student %s: %s", sid, e)
+        self._q.put(("backfill_done",))
+    # Compare photos
+    def _previous_photo(self):
+        sel = self.tree.selection()
+        if not sel or (self.meta.get(sel[0]) or {}).get("kind") != "photo":
+            return None
+        sibs = self.tree.get_children(self.tree.parent(sel[0]))
+        for iid in sibs[sibs.index(sel[0]) + 1:]:
+            m = self.meta.get(iid)
+            if m and m["kind"] == "photo":
+                return {**m, "iid": iid}
+        return None
+
+    def _toggle_compare(self):
+        if self._cmp_pil is not None or self._cmp_want is not None:
+            self._exit_compare()
+            return
+        sel = self.tree.selection()
+        prev = self._previous_photo()
+        if not sel or prev is None:
+            self.status.config(text="No earlier photo to compare with")
+            return
+        if self._pil_id != self._selected:
+            self.status.config(text="Wait for the photo to load first")
+            return
+        store = self.get_store()
+        if store is None:
+            return
+        short = lambda iid: self.tree.item(iid, "text").split(",")[0]   # "Oct 22"
+        self._cmp_labels = (f"PREVIOUS · {short(prev['iid'])}", f"SELECTED · {short(sel[0])}")
+        self._cmp_want = prev["id"]
+        if prev["id"] in self._cache:
+            self._set_compare(self._cache[prev["id"]])
+        else:
+            self.status.config(text="Loading previous photo...")
+            self._run(self._fetch_cmp, store, prev["id"])
+
+    def _fetch_cmp(self, store, fid):
+        return ("cmp", fid, store.download(fid))
+
+    def _set_compare(self, data):
+        self._cmp_pil = Image.open(io.BytesIO(data)).convert("RGB")
+        self.compare_btn.configure(text="Single")
+        self._fit()
+
+    def _leave_compare_state(self):
+        self._cmp_pil = None
+        self._cmp_want = None
+        self.compare_btn.configure(text="Compare")
+
+    def _exit_compare(self):
+        self._leave_compare_state()
+        self._on_select(None)
+        self._render()

@@ -43,7 +43,7 @@ LOCAL_TZ = ZoneInfo("America/Edmonton")  # match the Streamlit app's timezone
 TOKEN_REFRESH_INTERVAL_SECONDS = 30 * 60  # refresh well before Supabase's ~1hr token expiry
 
 STAFF_CODE_PATTERN = re.compile(r"^S\d{5}$")
-PHOTO_HIDDEN_STATUSES = {"withdrawn"}
+PHOTO_HIDDEN_STATUSES = {"withdrawn", "inactive"}
 
 # Substrings that show up in exceptions caused by *connectivity* problems
 # (no internet, DNS hiccup, request timeout, etc.) as opposed to a genuine
@@ -87,17 +87,7 @@ def load_config() -> dict:
         )
     with open(CONFIG_PATH, "rb") as f:
         return tomllib.load(f)
-    # --- AUTOMATED CREDENTIALS OBFUSCATION ---    
-    if "scanner" in config and "password" in config["scanner"]:
-        try:
-            encoded_pw = config["scanner"]["password"]
-            # Decode the base64 string back into standard human-readable text
-            decoded_bytes = base64.b64decode(encoded_pw.encode("utf-8"))
-            config["scanner"]["password"] = decoded_bytes.decode("utf-8")
-        except Exception:
-            # Fall back gracefully if the password string isn't encoded yet
-            pass
-    return config
+
 
 def save_config(config: dict) -> None:
     export_config = copy.deepcopy(config)
@@ -134,6 +124,8 @@ class ScannerDB:
         features_cfg = config.get("features", {})
         self.photo_unlocked = bool(features_cfg.get("drive_photos", False))
         self.photo_mode = self.photo_unlocked and bool(features_cfg.get("photo_mode", False))
+        self.stale_warn_days = int(features_cfg.get("stale_warn_days", 14))
+        self.stale_bad_days = int(features_cfg.get("stale_bad_days", 28))
 
         appearance_cfg = config.get("appearance", {})
         self.log_pills = bool(appearance_cfg.get("log_pills", False))
@@ -355,6 +347,14 @@ class ScannerDB:
         save_config(config)
         self.photo_mode = enabled
 
+    def save_stale_days(self, warn: int, bad: int) -> None:
+        config = load_config()
+        features = config.setdefault("features", {})
+        features["stale_warn_days"] = int(warn)
+        features["stale_bad_days"] = int(bad)
+        save_config(config)
+        self.stale_warn_days, self.stale_bad_days = int(warn), int(bad)
+
     def save_log_style(self, pills: bool, terminal: bool) -> None:
         config = load_config()
         config.setdefault("appearance", {}).update({"log_pills": pills, "log_terminal": terminal})
@@ -399,8 +399,11 @@ class ScannerDB:
 
     @staticmethod
     def is_withdrawn(student: dict) -> bool:
-        status = str(student.get("enrollment_status") or "").strip().lower()
-        return status in PHOTO_HIDDEN_STATUSES
+        """True for students the photo app should ignore (withdrawn or inactive)."""
+        for col in ("enrollment_status", "status"):
+            if str(student.get(col) or "").strip().lower() in PHOTO_HIDDEN_STATUSES:
+                return True
+        return False
 
     def search_students(self, query: str, limit: int = 50) -> list:
         terms = query.lower().replace(",", " ").split()

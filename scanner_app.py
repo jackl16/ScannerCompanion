@@ -370,6 +370,11 @@ class ScannerApp(ctk.CTk):
                         rowheight=int(32 * scale), font=(FONT, 11))
         style.map("Treeview", background=[("selected", COLORS["primary"])],
                   foreground=[("selected", COLORS["on_primary"])])
+        style.configure("Treeview.Heading", background=COLORS["card"], foreground=COLORS["text_muted"],
+                        font=(FONT, 10, "bold"), relief="flat", borderwidth=0, padding=(6, 6),
+                        bordercolor=COLORS["card"], lightcolor=COLORS["card"], darkcolor=COLORS["card"])
+        style.map("Treeview.Heading", background=[("active", COLORS["card"])],
+                  relief=[("active", "flat"), ("pressed", "flat")])        
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])  # no border
 
     def _make_menu(self):
@@ -861,6 +866,7 @@ class ScannerApp(ctk.CTk):
             command=self._on_photo_mode_toggled,
         )
         self.settings_menu.add_command(label="Choose Camera...", command=self._choose_camera)
+        self.settings_menu.add_command(label="Photo Alert Days...", command=self._configure_stale_days)
         self.settings_menu.add_command(label="Disconnect Google Drive...", command=self._disconnect_google)
         self._photo_toggle_added = True
 
@@ -921,6 +927,7 @@ class ScannerApp(ctk.CTk):
             self,
             get_store=lambda: self.photo_worker.store if self._ensure_photo_backend() else None,
             get_visible_students=self._visible_photo_students,
+            thresholds=(self.db.stale_warn_days, self.db.stale_bad_days),
         )
 
     def _visible_photo_students(self) -> dict:
@@ -989,7 +996,7 @@ class ScannerApp(ctk.CTk):
             return
         if self.db.is_withdrawn(student):
             self._play_feedback_sound(is_success=False)
-            msg = f"{student.get('first_name', '')} {student.get('last_name', '')} is withdrawn - no photo taken."
+            msg = f"{student.get('first_name', '')} {student.get('last_name', '')} is inactive or withdrawn - no photo taken."
             self.status_label.config(text=msg, fg=COLORS["error"])
             self._log(msg)
             return
@@ -1174,6 +1181,17 @@ class ScannerApp(ctk.CTk):
             self._log(f"Camera set to Camera {index + 1}")
 
         CameraPicker(self, self.db.camera_index, picked)
+
+    def _configure_stale_days(self):
+        from photo_capture import StaleDaysDialog
+
+        def saved(warn, bad):
+            self.db.save_stale_days(warn, bad)
+            if self._widget_alive("photo_browser"):
+                self.photo_browser.apply_thresholds(warn, bad)
+            self._log(f"Photo alerts set: amber after {warn} days, red after {bad} days")
+
+        StaleDaysDialog(self, self.db.stale_warn_days, self.db.stale_bad_days, saved)
 
     def _disconnect_google(self):
         if self._photo_busy:
