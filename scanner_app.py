@@ -17,7 +17,7 @@ import logging
 from app_log import setup_logging, log_dir
 log = logging.getLogger("scanner")
 
-CURRENT_VERSION = "1.0.6"
+CURRENT_VERSION = "1.0.7"
 MANIFEST_URL = "https://raw.githubusercontent.com/jackl16/ScannerCompanion/refs/heads/main/version.json"
 NORMAL_SIZE = "680x640"
 
@@ -40,7 +40,7 @@ from pathlib import Path
 import customtkinter as ctk
 from ui_kit import (COLORS, FONT, MONO, font, TopBar, StatusText,
                     LastScanCard, ScanLog, StatusPanel, ActionButton, MenuPanel,
-                    messagebox,simpledialog, ListPicker, set_log_style)
+                    messagebox,simpledialog, ListPicker, set_log_style, center_over)
 
 try:
     import winsound
@@ -237,6 +237,63 @@ class PortProbeThread(threading.Thread):
                             return
         except serial.SerialException as e:
             self.output_queue.put(("probe_status", self.port, f"error: {e}"))
+
+class UpdateDialog(ctk.CTkToplevel):
+    """Modal progress window shown while an update downloads."""
+
+    def __init__(self, parent, version):
+        super().__init__(parent)
+        self.withdraw()
+        self.configure(fg_color=COLORS["bg"])
+        self.title("Updating Scanner Companion")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", lambda: None)    # can't be closed mid-download
+
+        card = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=16,
+                            border_width=1, border_color=COLORS["border"])
+        card.pack(fill="both", expand=True, padx=12, pady=12)
+        ctk.CTkLabel(card, text=f"Updating to v{version}" if version else "Updating",
+                     font=font(16, "bold"), text_color=COLORS["text"]).pack(padx=32, pady=(18, 2))
+        self.status = ctk.CTkLabel(card, text="Starting download...", font=font(12),
+                                   text_color=COLORS["text_muted"])
+        self.status.pack(padx=32, pady=(0, 12))
+        self.bar = ctk.CTkProgressBar(card, width=320, height=12,
+                                      progress_color=COLORS["primary"], fg_color=COLORS["bg"])
+        self.bar.set(0)
+        self.bar.pack(padx=32, pady=(0, 20))
+
+        center_over(self, parent)
+        self.transient(parent)
+        self.deiconify()
+        self.after(150, self._grab)
+
+    def _grab(self):
+        try:
+            self.lift()
+            self.focus_force()
+            self.grab_set()                  # blocks clicks on the main window meanwhile
+        except Exception:
+            pass
+
+    def set_progress(self, done, total):
+        if total:
+            self.bar.set(min(1.0, done / total))
+            self.status.configure(text=f"Downloading...  {done / 1e6:.1f} / {total / 1e6:.1f} MB")
+        else:                                # server didn't say how big it is
+            if self.bar.cget("mode") != "indeterminate":
+                self.bar.configure(mode="indeterminate")
+                self.bar.start()
+            self.status.configure(text=f"Downloading...  {done / 1e6:.1f} MB")
+
+    def set_status(self, text):
+        self.status.configure(text=text)
+
+    def close(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
 
 
 class ScannerApp(ctk.CTk):
@@ -1496,77 +1553,118 @@ class ScannerApp(ctk.CTk):
         # except Exception as e:
         #     messagebox.showerror("Update Failed", f"Could not download update:\n{e}")
     def _apply_background_update(self, data):
-        """Downloads the new binary executable into a temp folder and triggers the file-swap batch handler."""
-        
+        """Downloads the new exe on a background thread (with a progress dialog),
+        then hands off to a batch script that swaps the files and relaunches."""
         download_url = data.get("url", "")
         if sys.platform != "win32":
             import webbrowser
             webbrowser.open(download_url)
             return
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo("Update", "Self-update only works in the built .exe, "
+                                          "not when running from source.")
+            return
         if not download_url.startswith("https://"):
             messagebox.showerror("Update Failed", "Update link is not secure.")
             return
+        if getattr(self, "_updating", False):
+            return
+        self._updating = True
 
+        exe_path = sys.executable
+        folder = os.path.dirname(exe_path)
+        self._update_paths = (exe_path,
+                              os.path.join(folder, "new_version.tmp"),
+                              os.path.join(folder, "update_process.bat"))
+        self._update_queue = queue.Queue()
+        self._update_dialog = UpdateDialog(self, data.get("version", ""))
+        threading.Thread(target=self._update_worker, args=(data,), daemon=True).start()
+        self.after(100, self._poll_update)
+
+    def _update_worker(self, data):
+        """Runs off the UI thread; reports back through self._update_queue."""
+        _, temp_new_exe, _ = self._update_paths
+        q = self._update_queue
         try:
-            # Update footer display state visually so the user doesn't close it mid-stream
-            if self._widget_alive("status_label"):
-                self.status_label.config(text="📥 Downloading software update... Please wait.", fg=COLORS["warning"])
-                self.update()
+            r = requests.get(data.get("url", ""), stream=True, timeout=30)
+            r.raise_for_status()
+            total = int(r.headers.get("Content-Length") or 0)
+            h, done = hashlib.sha256(), 0
+            with open(temp_new_exe, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    f.write(chunk)
+                    h.update(chunk)
+                    done += len(chunk)
+                    q.put(("progress", done, total))
 
-            r = requests.get(download_url, stream=True, timeout=30)
-            if r.status_code == 200:
-                # Path configurations
-                exe_path = os.path.abspath(sys.argv[0])          # Path to current running .exe
-                current_dir = os.path.dirname(exe_path)
-                temp_new_exe = os.path.join(current_dir, "new_version.tmp")
-                bat_script_path = os.path.join(current_dir, "update_process.bat")
-                
-                h = hashlib.sha256()
-                with open(temp_new_exe, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                        h.update(chunk)
+            q.put(("status", "Verifying download..."))
+            if not _update_is_authentic(data.get("version", ""), h.hexdigest(),
+                                        data.get("signature", "")):
+                os.remove(temp_new_exe)
+                q.put(("failed", "The downloaded update failed verification and was not installed."))
+                return
 
-                if not _update_is_authentic(data.get("version", ""), h.hexdigest(),
-                                            data.get("signature", "")):
-                    os.remove(temp_new_exe)
-                    messagebox.showerror("Update Failed",
-                                         "The downloaded update failed verification and was not installed.")
-                    if self._widget_alive("status_label"):
-                        self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
-                    return
-                        
-                # Create the automated Windows Batch background loop to overwrite the locked exe file
-                # The loop tries to delete the old application until it closes, then renames the temp file
-                bat_content = f"""
-                @echo off
-                timeout /t 2 /nobreak >nul
-                :loop
-                del "{exe_path}" >nul 2>&1
-                if exist "{exe_path}" (
-                    timeout /t 1 /nobreak >nul
-                    goto loop
-                )
-                move "{temp_new_exe}" "{exe_path}" >nul 2>&1
-                start "" "{exe_path}"
-                del "%~f0" & exit
-                """
-
-                with open(bat_script_path, "w") as bat_file:
-                    bat_file.write(bat_content)
-
-                subprocess.Popen([bat_script_path], shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
-                self._finish_photo_uploads()                
-                self.stop_event.set()
-                self.probe_stop_event.set()
-                self.db.stop()
-                self.destroy()
-                sys.exit()
-                
+            q.put(("status", "Finishing photo uploads..."))
+            self._finish_photo_uploads()     # waits up to 20s, which is fine off the UI thread
+            q.put(("ready",))
         except Exception as e:
-            messagebox.showerror("Update Interrupted", f"Could not complete installation:\n{e}")
-            if self._widget_alive("status_label"):
-                self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
+            try:
+                os.remove(temp_new_exe)
+            except OSError:
+                pass
+            q.put(("failed", f"Could not download the update:\n{e}"))
+
+    def _poll_update(self):
+        try:
+            try:
+                while True:
+                    msg = self._update_queue.get_nowait()
+                    if msg[0] == "progress":
+                        self._update_dialog.set_progress(msg[1], msg[2])
+                    elif msg[0] == "status":
+                        self._update_dialog.set_status(msg[1])
+                    elif msg[0] == "failed":
+                        self._update_dialog.close()
+                        self._updating = False
+                        messagebox.showerror("Update Failed", msg[1])
+                        return
+                    elif msg[0] == "ready":
+                        self._update_dialog.close()
+                        self._launch_update_and_exit()
+                        return
+            except queue.Empty:
+                pass
+            self.after(100, self._poll_update)
+        except tk.TclError:
+            pass                             # window was closed mid-update
+
+    def _launch_update_and_exit(self):
+        exe_path, temp_new_exe, bat_path = self._update_paths
+        # The relaunched exe must not inherit PyInstaller's environment, or it tries to
+        # reuse this process's (soon deleted) temp folder and fails to load Python.
+        bat = "\r\n".join([
+            "@echo off",
+            "set PYINSTALLER_RESET_ENVIRONMENT=1",
+            "set _MEIPASS2=",
+            "timeout /t 2 /nobreak >nul",
+            ":loop",
+            f'del "{exe_path}" >nul 2>&1',
+            f'if exist "{exe_path}" (',
+            "    timeout /t 1 /nobreak >nul",
+            "    goto loop",
+            ")",
+            f'move /y "{temp_new_exe}" "{exe_path}" >nul 2>&1',
+            f'start "" "{exe_path}"',
+            'del "%~f0" & exit',
+        ])
+        with open(bat_path, "w") as f:
+            f.write(bat)
+        subprocess.Popen([bat_path], shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        self.stop_event.set()
+        self.probe_stop_event.set()
+        self.db.stop()
+        self.destroy()       # mainloop ends and the process exits; no sys.exit() needed
+
 
     def _play_feedback_sound(self, is_success=True):
         """Plays a short chime (success) or soft low tone (error) if audio feedback is on."""
