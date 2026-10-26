@@ -17,7 +17,7 @@ import logging
 from app_log import setup_logging, log_dir
 log = logging.getLogger("scanner")
 
-CURRENT_VERSION = "1.0.7"
+CURRENT_VERSION = "1.1.0"
 MANIFEST_URL = "https://raw.githubusercontent.com/jackl16/ScannerCompanion/refs/heads/main/version.json"
 NORMAL_SIZE = "680x640"
 
