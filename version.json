@@ -2,5 +2,5 @@
   "version": "1.1.0",
   "url": "https://github.com/jackl16/ScannerCompanion/releases/download/v1.1.0/ScannerCompanion.exe",
   "changelog": "Massive UI overhaul, added custom styling\nPhoto Capture:\n- See each student's last photo date and days since\n- Sort by name, longest since last photo, or most recent\n- Students never photographed now show in the list\n- Amber/red highlighting for overdue photos (Settings > Photo Alert Days)\n- Filter box, Compare with previous photo, Open in Drive\n- Inactive students are hidden\n\nUpdates now show a progress bar.\nFixes: zoom label cut off, Recent Scans squashed.\n\nIf the app closes after this update, just reopen it.",
-  "signature":"e9f085b402751e442aa86b369228cd54a50b3487206c8d5ba176418ff84d1c93948799b84b46f565dba174d3a4aa2e49433a1965234f5cace48726c59d491406"
+  "signature":"142d5e4b6927c145a3fd292ef644af2a67d0779e0ea6d8612252c8e1b4776ba236c09e29819e292c809d9dfb914bbb6ec1a899291417ca6ae71b13f1266efe0e"
 }
