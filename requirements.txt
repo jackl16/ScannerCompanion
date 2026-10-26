@@ -1,6 +1,12 @@
-supabase
+customtkinter
 pyserial
+supabase
+tomli; python_version < "3.11"
 tomli_w
+keyring
 requests
+cryptography
+opencv-python
 pillow
-tzdata
+google-api-python-client
+google-auth-oauthlib
