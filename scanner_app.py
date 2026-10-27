@@ -958,8 +958,8 @@ class ScannerApp(ctk.CTk):
             self.log_frame.pack(fill="both", expand=False, padx=20, pady=(8, 12))
             self.log_list.configure(height=130)
             self.resizable(True, True)
-            self.minsize(760, 640)
-            self.geometry("900x760")
+            self.minsize(960, 640)
+            self.geometry("1100x760")
         else:
             self.mode_label.config(text="")
             for name in ("photo_search_frame", "photo_browser"):
@@ -989,13 +989,15 @@ class ScannerApp(ctk.CTk):
         )
 
     def _visible_photo_students(self) -> dict:
-        """s_id -> display label, for active students only (withdrawn are never listed)."""
+        """s_id -> (name, barcode, set of days), active students only."""
+        schedule = self.db.get_schedule_days()
         out = {}
         for s in self.db.get_students():
             if self.db.is_withdrawn(s):
                 continue
-            out[str(s["s_id"])] = (f"{s.get('first_name', '')} {s.get('last_name', '')} "
-                                   f"({s.get('barcode_code', '')})")
+            sid = str(s["s_id"])
+            name = f"{s.get('first_name', '')} {s.get('last_name', '')}".strip()
+            out[sid] = (name, str(s.get("barcode_code", "")), schedule.get(sid, set()))
         return out
 
     def _ensure_photo_backend(self) -> bool:

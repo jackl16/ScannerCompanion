@@ -28,12 +28,12 @@ from datetime import datetime
 from tkinter import ttk
 from ui_kit import messagebox
 
-from scanner_db import BASE_DIR as BASE
+from scanner_db import BASE_DIR as BASE, DAY_NAMES
 import customtkinter as ctk
 from ui_kit import COLORS, FONT, font, StatusText, center_over
 
 import cv2
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -72,6 +72,26 @@ LAST_KEY = "last_photo"   # appProperties key on each student folder, e.g. 2026-
 SORT_OPTIONS = ["A–Z", "Longest ago", "Most recent"]
 STALE_WARN_DAYS = 4     # amber from here
 STALE_BAD_DAYS = 14     # red from here (and for "Never")
+
+MAX_DAYS = 2    # selecting a third day switches off the oldest selected one
+
+# day -> (fill, text, outline or None)
+PILL_COLORS = {
+    "Mon": ("#facc15", "#422006", None),
+    "Tue": ("#ffffff", "#18181b", "#d4d4d8"),
+    "Wed": ("#000000", "#ffffff", "#71717a"),
+    "Thu": ("#22c55e", "#052e16", None),
+    "Sat": ("#dc2626", "#ffffff", None),
+}
+PILL_FALLBACK = ("#a1a1aa", "#18181b", None)   # for Fri/Sun if you bring them back
+
+def _pill_font(px):
+    for name in ("seguisb.ttf", "segoeui.ttf", "Arial Bold.ttf", "Arial.ttf", "DejaVuSans-Bold.ttf"):
+        try:
+            return ImageFont.truetype(name, px)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
 import json
 import keyring
@@ -901,6 +921,12 @@ class PhotoBrowser(ctk.CTkFrame):
         self._last = {}                 # student_id -> datetime of last photo
         self._checking = set()          # student ids whose date is still being looked up
         self._filter_text = ""
+        self._days = {}                 # student_id -> set of 'Mon', 'Tue', ...
+        self._search = {}               # student_id -> lowercase "name (days) barcode"
+        self._day_sel = set()           # days currently toggled on
+        self._day_btns = {}
+        self._shown = None              # rows currently displayed (after filters), for the count
+
         self.sort_var = tk.StringVar(value=SORT_OPTIONS[0])
         self.overdue_var = tk.BooleanVar(value=False) 
 
@@ -945,6 +971,16 @@ class PhotoBrowser(ctk.CTkFrame):
         self.filter_entry.pack(side="left", fill="x", expand=True)
         self.filter_entry.bind("<KeyRelease>", self._on_filter)
 
+        drow = ctk.CTkFrame(left, fg_color="transparent")
+        drow.pack(fill="x", padx=12, pady=(8, 0))
+        for d in DAY_NAMES:
+            b = ctk.CTkButton(drow, text=d, width=40, height=26, corner_radius=8, font=font(11),
+                              fg_color=COLORS["card_alt"], hover_color=COLORS["border"],
+                              text_color=COLORS["text"],
+                              command=lambda d=d: self._toggle_day(d))
+            b.pack(side="left", padx=(0, 4))
+            self._day_btns[d] = b
+
         tk.Frame(left, height=1, bg="#3f3f46").pack(fill="x", padx=12, pady=(10, 0))  # divider
 
         # footer status line: always present, so changing its text never moves anything.
@@ -955,12 +991,14 @@ class PhotoBrowser(ctk.CTkFrame):
 
         box = tk.Frame(left, bg=COLORS["card"])  # plain frame hosts the ttk tree + scrollbar
         box.pack(fill="both", expand=True, padx=(8, 4), pady=(6, 4))
-        self.tree = ttk.Treeview(box, columns=("last",), show="tree headings",
+        self.tree = ttk.Treeview(box, columns=("days", "last"), show="tree headings",
                                  selectmode="browse", height=6)
         self.tree.heading("#0", text="Student", anchor="w")
+        self.tree.heading("days", text="Days", anchor="w")
         self.tree.heading("last", text="Last photo", anchor="e")
         scale = max(self.winfo_fpixels("1i") / 96, 1.0)
-        self.tree.column("#0", width=220, stretch=True)
+        self.tree.column("#0", width=170, stretch=True)
+        self.tree.column("days", width=int(140 * scale), anchor="w", stretch=False)
         self.tree.column("last", width=int(150 * scale), anchor="e", stretch=False)
         self.tree.tag_configure("warn", foreground=COLORS["warning"])
         self.tree.tag_configure("stale", foreground=COLORS["error"])
@@ -1063,6 +1101,9 @@ class PhotoBrowser(ctk.CTkFrame):
         except Exception as e:
             self.status.config(text=f"Student list failed: {e}")
             return
+
+        self._days = {sid: v[2] for sid, v in visible.items()}
+        self._search = {sid: f"{v[0]} {v[1]} {self._days_text(sid)}".lower() for sid, v in visible.items()}
         self.tree.delete(*self.tree.get_children())
         self.meta.clear()
         self._loading.clear()
@@ -1077,15 +1118,15 @@ class PhotoBrowser(ctk.CTkFrame):
             if len(key) == 2 and key[0] == "student" and key[1] in visible:
                 sid = key[1]
                 seen.add(sid)
-                rows.append((visible[sid], f["id"], sid))
+                rows.append((visible[sid][0], f["id"], sid))
                 dt = self._parse_last(props.get(LAST_KEY))
                 if dt:
                     last[sid] = dt
                 else:
                     missing.append((sid, f["id"]))
-        for sid, label in visible.items():      # no Drive folder yet = never photographed
+        for sid, info in visible.items():      # no Drive folder yet = never photographed
             if sid not in seen:
-                rows.append((label, None, sid))
+                rows.append((info[0], None, sid))
         return ("root", rows, last, missing)
 
     def _on_open(self, event):
@@ -1381,9 +1422,13 @@ class PhotoBrowser(ctk.CTkFrame):
     def _populate_root(self):
         mode = self.sort_var.get()
         terms = self._filter_text.split()
-        rows = [r for r in self._rows if all(t in r[0].lower() for t in terms)]
+        rows = [r for r in self._rows
+                if all(t in self._search.get(r[2], r[0].lower()) for t in terms)]
+        if self._day_sel:        # must have every selected day (extra days are fine)
+            rows = [r for r in rows if self._day_sel <= self._days.get(r[2], set())]
         if self.overdue_var.get():
             rows = [r for r in rows if self._tag_for(r[2])]    # only amber or red rows
+        self._shown = rows
 
         def last_of(r):
             return self._last.get(r[2])
@@ -1400,7 +1445,8 @@ class PhotoBrowser(ctk.CTkFrame):
         self.meta.clear()
         self._loading.clear()
         for label, fid, sid in rows:
-            iid = self.tree.insert("", "end", text=label, values=(self._ago_for(sid),),
+            iid = self.tree.insert("", "end", text=label,
+                                   values=(self._days_text(sid), self._ago_for(sid)),
                                    tags=self._tag_for(sid))
             if fid:
                 self.meta[iid] = {"kind": "student", "id": fid, "student_id": sid}
@@ -1409,12 +1455,27 @@ class PhotoBrowser(ctk.CTkFrame):
                 self.meta[iid] = {"kind": "nophotos", "id": None, "student_id": sid}
         if not rows and self._rows:
             self.tree.insert("", "end", text="No students match")
+        if not self._checking:           # don't overwrite the "Loading photo dates..." message
+            self.status.config(text=self._count_text())
 
     def _on_filter(self, _event=None):
         text = self.filter_entry.get().strip().lower()
         if text != self._filter_text:        # ignore Shift/Tab/arrow key releases
             self._filter_text = text
             self._populate_root()
+
+    def _days_text(self, sid):
+        days = self._days.get(sid, set())
+        return " ".join(d for d in DAY_NAMES if d in days)
+
+    def _toggle_day(self, day):
+        if day in self._day_sel:
+            self._day_sel.discard(day)
+            self._day_btns[day].configure(fg_color=COLORS["card_alt"], hover_color=COLORS["border"])
+        else:
+            self._day_sel.add(day)
+            self._day_btns[day].configure(fg_color=COLORS["primary"], hover_color=COLORS["primary_dark"])
+        self._populate_root()
 
     def _ago_for(self, sid):
         if sid in self._last:
@@ -1435,11 +1496,16 @@ class PhotoBrowser(ctk.CTkFrame):
     def _refresh_row(self, sid):
         iid = self._student_iid(sid)
         if iid is not None:
-            self.tree.item(iid, values=(self._ago_for(sid),), tags=self._tag_for(sid))
+            self.tree.item(iid, values=(self._days_text(sid), self._ago_for(sid)),
+                           tags=self._tag_for(sid))
 
     def _count_text(self):
-        never = sum(1 for _, _, sid in self._rows if sid not in self._last)
-        return f"{len(self._rows)} students  ·  {never} never photographed"
+        rows = self._shown if self._shown is not None else self._rows
+        never = sum(1 for _, _, sid in rows if sid not in self._last)
+        text = f"{len(rows)} students  ·  {never} never photographed"
+        if len(rows) != len(self._rows):
+            text += f"  (of {len(self._rows)})"
+        return text
 
     def _open_in_drive(self):
         sel = self.tree.selection()

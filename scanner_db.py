@@ -45,6 +45,13 @@ TOKEN_REFRESH_INTERVAL_SECONDS = 30 * 60  # refresh well before Supabase's ~1hr 
 STAFF_CODE_PATTERN = re.compile(r"^S\d{5}$")
 PHOTO_HIDDEN_STATUSES = {"withdrawn", "inactive"}
 
+DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Sat"]
+
+def _norm_day(value):
+    """'Monday' / 'mon' / 'MON ' -> 'Mon'; anything unrecognised -> None."""
+    d = str(value or "").strip()[:3].title()
+    return d if d in DAY_NAMES else None
+
 # Substrings that show up in exceptions caused by *connectivity* problems
 # (no internet, DNS hiccup, request timeout, etc.) as opposed to a genuine
 # application error. Used to decide whether a failed scan should be queued
@@ -427,6 +434,34 @@ class ScannerDB:
         results.sort(key=lambda s: (str(s.get("first_name", "")).lower(),
                                     str(s.get("last_name", "")).lower()))
         return results[:limit]
+
+    def get_schedule_days(self) -> dict:
+        """{str(s_id): {'Mon', 'Wed', ...}} from student_schedule, cached like the student list."""
+        now = time.monotonic()
+        cache = getattr(self, "_sched_cache", None)
+        if cache is not None and now - self._sched_cache_time <= self._cache_ttl_seconds:
+            return cache
+
+        out, start, page = {}, 0, 1000       # Supabase returns max 1000 rows per request
+        while True:
+            rows = (
+                self.client.table("student_schedule")
+                .select("s_id, day_of_week")
+                # .eq("center_id", self.center_id)   # uncomment if student_schedule has this column
+                .order("s_id").order("day_of_week")
+                .range(start, start + page - 1)
+                .execute().data
+            )
+            for r in rows:
+                d = _norm_day(r.get("day_of_week"))
+                if d:
+                    out.setdefault(str(r["s_id"]), set()).add(d)
+            if len(rows) < page:
+                break
+            start += page
+
+        self._sched_cache, self._sched_cache_time = out, now
+        return out        
     # --- attendance ---
 
     def get_today_attendance(self, s_id: int, day: str | None = None) -> dict | None:
