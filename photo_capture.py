@@ -595,10 +595,14 @@ class ContextMenu(ctk.CTkToplevel):
         inner = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=0)
         inner.pack(padx=1, pady=1)
         for label, command in items:
-            ctk.CTkButton(inner, text=label, anchor="w", width=180, height=32, corner_radius=6,
-                          font=font(12), fg_color="transparent", hover_color=COLORS["border"],
-                          text_color=COLORS["text"],
-                          command=lambda c=command: self._choose(c)).pack(fill="x", padx=4, pady=3)
+                    # Check if this item should have red text
+                    text_color = "#ef4444" if "Delete" in label else COLORS["text"]
+                    hover_color = "#450a0a" if "Delete" in label else COLORS["border"]
+
+                    ctk.CTkButton(inner, text=label, anchor="w", width=180, height=32, corner_radius=6,
+                                font=font(12), fg_color="transparent", hover_color=hover_color,
+                                text_color=text_color,
+                                command=lambda c=command: self._choose(c)).pack(fill="x", padx=4, pady=3)
         self.update_idletasks()
         x = max(0, min(x, self.winfo_screenwidth() - self.winfo_reqwidth() - 4))    # keep on screen
         y = max(0, min(y, self.winfo_screenheight() - self.winfo_reqheight() - 4))
@@ -1200,6 +1204,8 @@ class PhotoBrowser(ctk.CTkFrame):
     # --- results (always on the Tk thread) ---
 
     def _handle(self, msg):
+        if msg is None:
+            return
         kind = msg[0]
         if kind == "root":
             _, self._rows, self._last, missing = msg
@@ -1255,6 +1261,18 @@ class PhotoBrowser(ctk.CTkFrame):
             if fid == self._cmp_want:
                 self._set_compare(data)
             self.status.config(text="")
+        elif kind == "photo_deleted":
+            _, iid = msg
+            if iid == self.tree.selection():
+                self._pil = None
+                self._pil_id = None
+                self._selected = None
+                self.canvas.delete("all")
+                self.caption.configure(text="")
+                self.open_btn.configure(state="disabled")
+                self.compare_btn.configure(state="disabled")
+            self.tree.delete(iid)
+            self.status.config(text="Photo deleted from Drive")
         elif kind == "error":
             self._loading.clear()
             self.status.config(text=f"Error: {msg[1]}")
@@ -1299,6 +1317,41 @@ class PhotoBrowser(ctk.CTkFrame):
         elif student_iid not in self._loading:
             self._loading.add(student_iid)  # first photo for this subject: its folder is new
             self._run(self._fetch_children, store, student_iid, self.meta[student_iid])
+
+    def _delete_selected_photo(self):
+        sel = self.tree.selection()
+        meta = self.meta.get(sel[0]) if sel else None
+        if not meta or meta.get("kind") != "photo":
+            self.status.config(text="Select a photo to delete")
+            return
+        
+        # Confirmation popup
+        if not messagebox.askyesno(
+            "Delete Photo", 
+            "Are you sure you want to permanently delete this photo from Google Drive?",
+            parent=self
+        ):
+            return
+
+        store = self.get_store()
+        if store is None:
+            self.status.config(text="Drive not connected")
+            return
+
+        file_id = meta["id"]
+        try:
+            # Delete from Google Drive in the background
+            def do_delete():
+                try:
+                    store.svc.files().delete(fileId=file_id).execute()
+                    self._q.put(("photo_deleted", sel[0]))
+                except Exception as e:
+                    self._q.put(("error", f"Delete failed: {e}"))
+            
+            self.status.config(text="Deleting photo...")
+            self._run(do_delete)
+        except Exception as e:
+            self.status.config(text=f"Delete failed: {e}")
 
     def apply_thresholds(self, warn, bad):
         self.warn_days, self.bad_days = warn, bad
@@ -1645,17 +1698,24 @@ class PhotoBrowser(ctk.CTkFrame):
         self.on_take_photo(sid)
 
     def _on_right_click(self, event):
-        iid = self.tree.identify_row(event.y)
-        meta = self.meta.get(iid)
-        if not meta:
-            return
-        self.tree.selection_set(iid)         # right-clicked row becomes the selected one
-        self.tree.focus(iid)
-        items = []
-        if self.on_take_photo is not None:
-            items.append(("📷  Take photo", self._take_photo))
-        if meta.get("id"):                   # "never" students have no Drive folder yet
-            items.append(("Open in Drive", self._open_in_drive))
-        if items:
-            ContextMenu(self, items, event.x_root, event.y_root)
-        return "break"
+            iid = self.tree.identify_row(event.y)
+            meta = self.meta.get(iid)
+            if not meta:
+                return
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            
+            items = []
+            if self.on_take_photo is not None and meta.get("kind") != "photo":
+                items.append(("📷  Take photo", self._take_photo))
+                
+            if meta.get("id"):
+                items.append(("Open in Drive", self._open_in_drive))
+                
+            # Add Delete option only for individual photo files
+            if meta.get("kind") == "photo":
+                items.append(("Delete from Drive", self._delete_selected_photo))
+
+            if items:
+                ContextMenu(self, items, event.x_root, event.y_root)
+            return "break"
