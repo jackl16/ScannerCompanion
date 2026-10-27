@@ -822,9 +822,10 @@ class PhotoBrowser(ctk.CTkFrame):
     One API call per folder expanded and per photo opened. All Drive work runs on
     background threads and reports back through a queue polled on the Tk thread."""
 
-    def __init__(self, parent, get_store, get_visible_students,thresholds=(STALE_WARN_DAYS, STALE_BAD_DAYS)):
+    def __init__(self, parent, get_store, get_visible_students, thresholds=(STALE_WARN_DAYS, STALE_BAD_DAYS), on_take_photo=None):
         super().__init__(parent, fg_color="transparent")
         self.warn_days, self.bad_days = thresholds
+        self.on_take_photo = on_take_photo
         self.get_store = get_store                          # -> DriveStore or None
         self.get_visible_students = get_visible_students    # -> {s_id: "First Last (barcode)"}
         self.meta = {}                  # tree item id -> {"kind", "id", ...}
@@ -848,6 +849,8 @@ class PhotoBrowser(ctk.CTkFrame):
         self._checking = set()          # student ids whose date is still being looked up
         self._filter_text = ""
         self.sort_var = tk.StringVar(value=SORT_OPTIONS[0])
+        self.overdue_var = tk.BooleanVar(value=False)
+
 
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
@@ -890,6 +893,10 @@ class PhotoBrowser(ctk.CTkFrame):
                                  wraplength=290)
         self.status.pack(side="bottom", fill="x", padx=14, pady=(4, 10))
         tk.Frame(left, height=1, bg="#3f3f46").pack(side="bottom", fill="x", padx=12)
+        ctk.CTkButton(left, text="📷  Take photo", height=34, corner_radius=8,
+                font=font(13, "bold"), fg_color=COLORS["primary"],
+                hover_color=COLORS["primary_dark"], text_color=COLORS["on_primary"],
+                command=self._take_photo).pack(side="bottom", fill="x", padx=12, pady=(6, 8))
 
         box = tk.Frame(left, bg=COLORS["card"])  # plain frame hosts the ttk tree + scrollbar
         box.pack(fill="both", expand=True, padx=(8, 4), pady=(6, 4))
@@ -1438,3 +1445,21 @@ class PhotoBrowser(ctk.CTkFrame):
         self._leave_compare_state()
         self._on_select(None)
         self._render()
+
+    def _selected_student_id(self):
+        """The student for the selected row, even if a subject or photo row is selected."""
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        iid = sel[0]
+        while self.tree.parent(iid):
+            iid = self.tree.parent(iid)
+        m = self.meta.get(iid)
+        return m.get("student_id") if m else None
+
+    def _take_photo(self):
+        sid = self._selected_student_id()
+        if sid is None or self.on_take_photo is None:
+            self.status.config(text="Select a student first")
+            return
+        self.on_take_photo(sid)
