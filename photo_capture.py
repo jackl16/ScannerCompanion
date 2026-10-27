@@ -74,6 +74,7 @@ STALE_WARN_DAYS = 4     # amber from here
 STALE_BAD_DAYS = 14     # red from here (and for "Never")
 
 MAX_DAYS = 2    # selecting a third day switches off the oldest selected one
+MIN_PILLS = 2   # rows with fewer days are padded with "n/a" pills
 
 # day -> (fill, text, outline or None)
 PILL_COLORS = {
@@ -82,6 +83,7 @@ PILL_COLORS = {
     "Wed": ("#000000", "#ffffff", "#71717a"),
     "Thu": ("#22c55e", "#052e16", None),
     "Sat": ("#dc2626", "#ffffff", None),
+    "n/a": ("#3f3f46", "#a1a1aa", None),
 }
 PILL_FALLBACK = ("#a1a1aa", "#18181b", None)   # for Fri/Sun if you bring them back
 
@@ -923,12 +925,17 @@ class PhotoBrowser(ctk.CTkFrame):
         self._filter_text = ""
         self._days = {}                 # student_id -> set of 'Mon', 'Tue', ...
         self._search = {}               # student_id -> lowercase "name (days) barcode"
-        self._day_sel = set()           # days currently toggled on
+        self._day_order = []            # selected days, oldest click first
+        self._pill_cache = {}           # tuple of days -> PhotoImage (also keeps Tk from dropping them)
+        self._pill_slots = 1            # widest day count among students, so all strips match
+        self._pill_scale = max(self.winfo_fpixels("1i") / 96, 1.0)
         self._day_btns = {}
         self._shown = None              # rows currently displayed (after filters), for the count
 
         self.sort_var = tk.StringVar(value=SORT_OPTIONS[0])
         self.overdue_var = tk.BooleanVar(value=False) 
+
+        self._render_job = None
 
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
@@ -972,13 +979,14 @@ class PhotoBrowser(ctk.CTkFrame):
         self.filter_entry.bind("<KeyRelease>", self._on_filter)
 
         drow = ctk.CTkFrame(left, fg_color="transparent")
-        drow.pack(fill="x", padx=12, pady=(8, 0))
-        for d in DAY_NAMES:
-            b = ctk.CTkButton(drow, text=d, width=40, height=26, corner_radius=8, font=font(11),
+        drow.pack(fill="x", padx=10, pady=(8, 0))
+        for i, d in enumerate(DAY_NAMES):
+            drow.columnconfigure(i, weight=1, uniform="days")
+            b = ctk.CTkButton(drow, text=d, width=10, height=28, corner_radius=8, font=font(12),
                               fg_color=COLORS["card_alt"], hover_color=COLORS["border"],
                               text_color=COLORS["text"],
                               command=lambda d=d: self._toggle_day(d))
-            b.pack(side="left", padx=(0, 4))
+            b.grid(row=0, column=i, sticky="ew", padx=2)
             self._day_btns[d] = b
 
         tk.Frame(left, height=1, bg="#3f3f46").pack(fill="x", padx=12, pady=(10, 0))  # divider
@@ -991,14 +999,12 @@ class PhotoBrowser(ctk.CTkFrame):
 
         box = tk.Frame(left, bg=COLORS["card"])  # plain frame hosts the ttk tree + scrollbar
         box.pack(fill="both", expand=True, padx=(8, 4), pady=(6, 4))
-        self.tree = ttk.Treeview(box, columns=("days", "last"), show="tree headings",
+        self.tree = ttk.Treeview(box, columns=("last",), show="tree headings",
                                  selectmode="browse", height=6)
-        self.tree.heading("#0", text="Student", anchor="w")
-        self.tree.heading("days", text="Days", anchor="w")
+        self.tree.heading("#0", text="Days  /  Student", anchor="w")
         self.tree.heading("last", text="Last photo", anchor="e")
         scale = max(self.winfo_fpixels("1i") / 96, 1.0)
-        self.tree.column("#0", width=170, stretch=True)
-        self.tree.column("days", width=int(140 * scale), anchor="w", stretch=False)
+        self.tree.column("#0", width=300, stretch=True)
         self.tree.column("last", width=int(150 * scale), anchor="e", stretch=False)
         self.tree.tag_configure("warn", foreground=COLORS["warning"])
         self.tree.tag_configure("stale", foreground=COLORS["error"])
@@ -1045,7 +1051,7 @@ class PhotoBrowser(ctk.CTkFrame):
                                        text_color=COLORS["text"])
         self.zoom_label.pack(side="left", padx=(6, 0))
 
-        self.canvas.bind("<Configure>", lambda e: self._render())
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<ButtonPress-1>", self._drag_start)
         self.canvas.bind("<B1-Motion>", self._drag_move)
@@ -1104,6 +1110,8 @@ class PhotoBrowser(ctk.CTkFrame):
 
         self._days = {sid: v[2] for sid, v in visible.items()}
         self._search = {sid: f"{v[0]} {v[1]} {self._days_text(sid)}".lower() for sid, v in visible.items()}
+        self._pill_slots = max([MIN_PILLS] + [len(v[2]) for v in visible.values()])
+        self._pill_cache.clear()
         self.tree.delete(*self.tree.get_children())
         self.meta.clear()
         self._loading.clear()
@@ -1396,6 +1404,20 @@ class PhotoBrowser(ctk.CTkFrame):
             x0, y0, px, py = self._drag
             self._pan_x, self._pan_y = px + e.x - x0, py + e.y - y0
             self._render()
+
+    def _on_canvas_configure(self, event=None):
+        """Re-render once the window stops changing size, not on every drag event."""
+        if self._render_job is not None:
+            try:
+                self.after_cancel(self._render_job)
+            except Exception:
+                pass
+        self._render_job = self.after(80, self._render_after_resize)
+
+    def _render_after_resize(self):
+        self._render_job = None
+        if self.winfo_exists():
+            self._render()            
     # dates and sort
     @staticmethod
     def _parse_last(s):
@@ -1424,8 +1446,8 @@ class PhotoBrowser(ctk.CTkFrame):
         terms = self._filter_text.split()
         rows = [r for r in self._rows
                 if all(t in self._search.get(r[2], r[0].lower()) for t in terms)]
-        if self._day_sel:        # must have every selected day (extra days are fine)
-            rows = [r for r in rows if self._day_sel <= self._days.get(r[2], set())]
+        if self._day_order:      # must have every selected day (extra days are fine)
+            rows = [r for r in rows if set(self._day_order) <= self._days.get(r[2], set())]
         if self.overdue_var.get():
             rows = [r for r in rows if self._tag_for(r[2])]    # only amber or red rows
         self._shown = rows
@@ -1445,9 +1467,8 @@ class PhotoBrowser(ctk.CTkFrame):
         self.meta.clear()
         self._loading.clear()
         for label, fid, sid in rows:
-            iid = self.tree.insert("", "end", text=label,
-                                   values=(self._days_text(sid), self._ago_for(sid)),
-                                   tags=self._tag_for(sid))
+            iid = self.tree.insert("", "end", text=label, image=self._pill_img(sid),
+                                   values=(self._ago_for(sid),), tags=self._tag_for(sid))
             if fid:
                 self.meta[iid] = {"kind": "student", "id": fid, "student_id": sid}
                 self.tree.insert(iid, "end", text="Loading...")
@@ -1468,13 +1489,40 @@ class PhotoBrowser(ctk.CTkFrame):
         days = self._days.get(sid, set())
         return " ".join(d for d in DAY_NAMES if d in days)
 
+    def _pill_img(self, sid):
+        have = tuple(d for d in DAY_NAMES if d in self._days.get(sid, set()))
+        days = have + ("n/a",) * max(0, MIN_PILLS - len(have))
+        img = self._pill_cache.get(days)
+        if img is None:
+            k, s = 3, self._pill_scale                     # draw 3x, then shrink for smooth edges
+            pw, ph, gap = int(34 * s), int(18 * s), int(4 * s)
+            slots = max(self._pill_slots, MIN_PILLS)
+            pad = int(12 * s)                       # blank space between the pills and the name
+            width = slots * (pw + gap) - gap + pad
+            canvas = Image.new("RGBA", (width * k, ph * k), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(canvas)
+            fnt = _pill_font(int(ph * k * 0.58))
+            for i, d in enumerate(days):
+                fill, text, edge = PILL_COLORS.get(d, PILL_FALLBACK)
+                x0 = i * (pw + gap) * k
+                draw.rounded_rectangle((x0, 0, x0 + pw * k - 1, ph * k - 1), radius=ph * k // 2,
+                                       fill=fill, outline=edge, width=k)
+                draw.text((x0 + pw * k / 2, ph * k / 2), d, font=fnt, fill=text, anchor="mm")
+            img = ImageTk.PhotoImage(canvas.resize((width, ph), Image.LANCZOS))
+            self._pill_cache[days] = img
+        return img
+
     def _toggle_day(self, day):
-        if day in self._day_sel:
-            self._day_sel.discard(day)
-            self._day_btns[day].configure(fg_color=COLORS["card_alt"], hover_color=COLORS["border"])
+        if day in self._day_order:
+            self._day_order.remove(day)
         else:
-            self._day_sel.add(day)
-            self._day_btns[day].configure(fg_color=COLORS["primary"], hover_color=COLORS["primary_dark"])
+            self._day_order.append(day)
+            if len(self._day_order) > MAX_DAYS:
+                self._day_order.pop(0)          # drop the earliest-clicked day
+        for d, b in self._day_btns.items():
+            on = d in self._day_order
+            b.configure(fg_color=COLORS["primary"] if on else COLORS["card_alt"],
+                        hover_color=COLORS["primary_dark"] if on else COLORS["border"])
         self._populate_root()
 
     def _ago_for(self, sid):
@@ -1496,8 +1544,7 @@ class PhotoBrowser(ctk.CTkFrame):
     def _refresh_row(self, sid):
         iid = self._student_iid(sid)
         if iid is not None:
-            self.tree.item(iid, values=(self._days_text(sid), self._ago_for(sid)),
-                           tags=self._tag_for(sid))
+            self.tree.item(iid, values=(self._ago_for(sid),), tags=self._tag_for(sid))
 
     def _count_text(self):
         rows = self._shown if self._shown is not None else self._rows
