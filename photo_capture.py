@@ -561,6 +561,59 @@ class StaleDaysDialog(ctk.CTkToplevel):
         self.destroy()
         self.on_save(warn, bad)
 
+class ContextMenu(ctk.CTkToplevel):
+    """Small dark popup menu shown at the mouse position (for right-click)."""
+
+    def __init__(self, parent, items, x, y):
+        super().__init__(parent)
+        self._parent = parent
+        self.withdraw()
+        self.overrideredirect(True)
+        self.configure(fg_color=COLORS["border"])            # shows as a 1px outline
+        inner = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=0)
+        inner.pack(padx=1, pady=1)
+        for label, command in items:
+            ctk.CTkButton(inner, text=label, anchor="w", width=180, height=32, corner_radius=6,
+                          font=font(12), fg_color="transparent", hover_color=COLORS["border"],
+                          text_color=COLORS["text"],
+                          command=lambda c=command: self._choose(c)).pack(fill="x", padx=4, pady=3)
+        self.update_idletasks()
+        x = max(0, min(x, self.winfo_screenwidth() - self.winfo_reqwidth() - 4))    # keep on screen
+        y = max(0, min(y, self.winfo_screenheight() - self.winfo_reqheight() - 4))
+        self.geometry(f"+{x}+{y}")
+        self.deiconify()
+        self.lift()
+        self.bind("<Escape>", lambda e: self.close())
+        for seq in ("<Button-1>", "<Button-2>", "<Button-3>"):
+            self.bind(seq, self._check_outside)
+        self.after(50, self._capture)
+
+    def _capture(self):
+        try:
+            self.focus_force()
+            self.grab_set()          # so a click anywhere else reaches us and can close the menu
+        except Exception:
+            pass
+
+    def _check_outside(self, event):
+        px, py = self.winfo_pointerxy()
+        inside = (self.winfo_rootx() <= px < self.winfo_rootx() + self.winfo_width()
+                  and self.winfo_rooty() <= py < self.winfo_rooty() + self.winfo_height())
+        if not inside:
+            self.close()
+
+    def _choose(self, command):
+        parent = self._parent
+        self.close()
+        parent.after(10, command)    # run after the menu is gone so dialogs open cleanly
+
+    def close(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
 
 class CameraPicker(ctk.CTkToplevel):
     """Cycles through connected cameras with a live preview; the user picks the one to use."""
@@ -822,9 +875,10 @@ class PhotoBrowser(ctk.CTkFrame):
     One API call per folder expanded and per photo opened. All Drive work runs on
     background threads and reports back through a queue polled on the Tk thread."""
 
-    def __init__(self, parent, get_store, get_visible_students,thresholds=(STALE_WARN_DAYS, STALE_BAD_DAYS)):
+    def __init__(self, parent, get_store, get_visible_students,thresholds=(STALE_WARN_DAYS, STALE_BAD_DAYS), on_take_photo=None):
         super().__init__(parent, fg_color="transparent")
         self.warn_days, self.bad_days = thresholds
+        self.on_take_photo = on_take_photo
         self.get_store = get_store                          # -> DriveStore or None
         self.get_visible_students = get_visible_students    # -> {s_id: "First Last (barcode)"}
         self.meta = {}                  # tree item id -> {"kind", "id", ...}
@@ -848,6 +902,7 @@ class PhotoBrowser(ctk.CTkFrame):
         self._checking = set()          # student ids whose date is still being looked up
         self._filter_text = ""
         self.sort_var = tk.StringVar(value=SORT_OPTIONS[0])
+        self.overdue_var = tk.BooleanVar(value=False) 
 
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
@@ -876,11 +931,18 @@ class PhotoBrowser(ctk.CTkFrame):
             text_color=COLORS["text"],
         ).pack(fill="x", padx=12, pady=(8, 0))
 
+        frow = ctk.CTkFrame(left, fg_color="transparent")
+        frow.pack(fill="x", padx=12, pady=(8, 0))
+        ctk.CTkCheckBox(frow, text="Overdue", variable=self.overdue_var, width=90,
+                        command=self._populate_root, font=font(12),
+                        checkbox_width=18, checkbox_height=18, corner_radius=5, border_width=2,
+                        border_color=COLORS["text_muted"], fg_color=COLORS["primary"],
+                        hover_color=COLORS["primary_dark"]).pack(side="right", padx=(10, 0))
         self.filter_entry = ctk.CTkEntry(
-            left, height=30, corner_radius=8, font=font(12),
+            frow, height=30, corner_radius=8, font=font(12),
             placeholder_text="Filter by name or barcode",
             fg_color=COLORS["bg"], border_color=COLORS["border"])
-        self.filter_entry.pack(fill="x", padx=12, pady=(8, 0))
+        self.filter_entry.pack(side="left", fill="x", expand=True)
         self.filter_entry.bind("<KeyRelease>", self._on_filter)
 
         tk.Frame(left, height=1, bg="#3f3f46").pack(fill="x", padx=12, pady=(10, 0))  # divider
@@ -954,6 +1016,12 @@ class PhotoBrowser(ctk.CTkFrame):
         self.tree.bind("<<TreeviewOpen>>", self._on_open)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Double-1>", self._on_double_click)
+
+        # Mac reports right-click as Button-2, and Ctrl-click counts as one too
+        seqs = ("<Button-2>", "<Control-Button-1>") if sys.platform == "darwin" else ("<Button-3>",)
+        for seq in seqs:
+            self.tree.bind(seq, self._on_right_click)       
+
         self.bind("<Destroy>", self._on_destroy)
         self._poll()
 
@@ -1185,9 +1253,13 @@ class PhotoBrowser(ctk.CTkFrame):
 
     def apply_thresholds(self, warn, bad):
         self.warn_days, self.bad_days = warn, bad
-        for iid, m in self.meta.items():
-            if m["kind"] in ("student", "nophotos"):
-                self.tree.item(iid, tags=self._tag_for(m["student_id"]))
+        if self.overdue_var.get():
+            self._populate_root()       # membership changed, so rebuild
+        else:
+            for iid, m in self.meta.items():
+                if m["kind"] in ("student", "nophotos"):
+                    self.tree.item(iid, tags=self._tag_for(m["student_id"]))
+        self.status.config(text=self._count_text())
 
     @staticmethod
     def _pretty_time(name):
@@ -1310,6 +1382,8 @@ class PhotoBrowser(ctk.CTkFrame):
         mode = self.sort_var.get()
         terms = self._filter_text.split()
         rows = [r for r in self._rows if all(t in r[0].lower() for t in terms)]
+        if self.overdue_var.get():
+            rows = [r for r in rows if self._tag_for(r[2])]    # only amber or red rows
 
         def last_of(r):
             return self._last.get(r[2])
@@ -1438,3 +1512,37 @@ class PhotoBrowser(ctk.CTkFrame):
         self._leave_compare_state()
         self._on_select(None)
         self._render()
+
+    def _selected_student_id(self):
+        """The student for the selected row, even if a subject or photo row is selected."""
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        iid = sel[0]
+        while self.tree.parent(iid):
+            iid = self.tree.parent(iid)
+        m = self.meta.get(iid)
+        return m.get("student_id") if m else None
+
+    def _take_photo(self):
+        sid = self._selected_student_id()
+        if sid is None or self.on_take_photo is None:
+            self.status.config(text="Select a student first")
+            return
+        self.on_take_photo(sid)
+
+    def _on_right_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        meta = self.meta.get(iid)
+        if not meta:
+            return
+        self.tree.selection_set(iid)         # right-clicked row becomes the selected one
+        self.tree.focus(iid)
+        items = []
+        if self.on_take_photo is not None:
+            items.append(("📷  Take photo", self._take_photo))
+        if meta.get("id"):                   # "never" students have no Drive folder yet
+            items.append(("Open in Drive", self._open_in_drive))
+        if items:
+            ContextMenu(self, items, event.x_root, event.y_root)
+        return "break"

@@ -985,6 +985,7 @@ class ScannerApp(ctk.CTk):
             get_store=lambda: self.photo_worker.store if self._ensure_photo_backend() else None,
             get_visible_students=self._visible_photo_students,
             thresholds=(self.db.stale_warn_days, self.db.stale_bad_days),
+            on_take_photo=self._take_photo_for,
         )
 
     def _visible_photo_students(self) -> dict:
@@ -1045,6 +1046,14 @@ class ScannerApp(ctk.CTk):
             return
 
         self._start_photo_for_student(student)
+
+    def _take_photo_for(self, sid):
+        """Called by the photo browser's right-click menu."""
+        for s in self.db.get_students():
+            if str(s.get("s_id")) == str(sid):
+                self._start_photo_for_student(s)   # handles busy, inactive/withdrawn, no subjects
+                return
+        self.status_label.config(text="Student not found.", fg=COLORS["error"])
 
     def _start_photo_for_student(self, student: dict):
         """Shared by scans, typed barcodes and name search: opens the camera for each subject."""
