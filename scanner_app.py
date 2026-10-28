@@ -992,6 +992,7 @@ class ScannerApp(ctk.CTk):
 
     def _visible_photo_students(self) -> dict:
         """s_id -> (name, barcode, set of days), active students only."""
+        from photo_capture import student_subjects
         schedule = self.db.get_schedule_days()
         out = {}
         for s in self.db.get_students():
@@ -999,7 +1000,7 @@ class ScannerApp(ctk.CTk):
                 continue
             sid = str(s["s_id"])
             name = f"{s.get('first_name', '')} {s.get('last_name', '')}".strip()
-            out[sid] = (name, str(s.get("barcode_code", "")), schedule.get(sid, set()))
+            out[sid] = (name, str(s.get("barcode_code", "")), schedule.get(sid, set()), set(student_subjects(s)))
         return out
 
     def _ensure_photo_backend(self) -> bool:
@@ -1073,7 +1074,7 @@ class ScannerApp(ctk.CTk):
         if not self._ensure_photo_backend():
             return
 
-        from photo_capture import PhotoDialog, student_photo_info
+        from photo_capture import PhotoDialog, folder_tags, student_photo_info
 
         try:
             info = student_photo_info(student)
@@ -1127,13 +1128,14 @@ class ScannerApp(ctk.CTk):
                         next_step()
 
                 step_no = total - len(steps)
-                subtitle = f"{folder}  •  step {step_no} of {total}"
+                subtitle = f"Step {step_no} of {total}"
                 if taken:
                     subtitle += f"  •  photo {taken + 1}"
                 try:
                     PhotoDialog(
                         self, label, done,
                         stream=self._get_camera(), subtitle=subtitle, multi=multi,
+                        tags=folder_tags(folder),
                         theme={"colors": COLORS, "font": FONT},
                         zoom=self.db.camera_zoom, on_zoom=self.db.save_camera_zoom,
                     )

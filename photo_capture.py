@@ -88,6 +88,11 @@ PILL_COLORS = {
 }
 PILL_FALLBACK = ("#a1a1aa", "#18181b", None)   # for Fri/Sun if you bring them back
 
+SUBJECT_ORDER = ["Math", "Reading"]
+SUBJECT_LETTER = {"Math": "M", "Reading": "R"}
+SUBJECT_COLORS = {"Math": ("#3b82f6", "#ffffff", None), "Reading": ("#a855f7", "#ffffff", None)}
+KIND_COLORS = {"Planning": ("#06b6d4", "#083344", None), "Scores": ("#ec4899", "#ffffff", None)}
+
 def _pill_font(px):
     for name in ("seguisb.ttf", "segoeui.ttf", "Arial Bold.ttf", "Arial.ttf", "DejaVuSans-Bold.ttf"):
         try:
@@ -268,7 +273,11 @@ class DriveStore:
         self.svc.files().update(fileId=student_folder,
                                 body={"appProperties": {LAST_KEY: iso}}).execute()
 
-    def backfill_last_photo(self, student_folder):
+    def delete_photo(self, file_id):
+        with self._lock:
+            self.svc.files().delete(fileId=file_id).execute()
+
+    def backfill_last_photo(self, student_folder, clear_if_empty=False):
         """One-time: finds the newest photo across a student's subject folders (by file name,
         which is the timestamp), saves it on the folder, and returns it. None if no photos."""
         newest = None
@@ -294,6 +303,10 @@ class DriveStore:
                     fileId=student_folder,
                     body={"appProperties": {LAST_KEY: newest.strftime("%Y-%m-%dT%H:%M:%S")}}
                 ).execute()
+            elif clear_if_empty:                  # only after a delete, not on every page load
+                self.svc.files().update(
+                    fileId=student_folder, body={"appProperties": {LAST_KEY: None}}
+                ).execute()
         return newest
 
 
@@ -309,7 +322,7 @@ class PhotoDialog(ctk.CTkToplevel):
     PREVIEW_W = 640  # raise to ~800 for a bigger preview if the screen allows
 
     def __init__(self, parent, label, on_done, stream, confirm=CONFIRM_PHOTO, subtitle="",
-                theme=None, zoom=1.0, on_zoom=None, multi=False):
+                theme=None, zoom=1.0, on_zoom=None, multi=False, tags=None):
         super().__init__(parent)
         self.withdraw()
         self.configure(fg_color=COLORS["bg"])
@@ -337,6 +350,13 @@ class PhotoDialog(ctk.CTkToplevel):
         names.pack(side="left", fill="x", expand=True)
         ctk.CTkLabel(names, text=label, font=font(20, "bold"), anchor="w",
                      text_color=COLORS["text"]).pack(fill="x")
+        if tags:
+            prow = ctk.CTkFrame(names, fg_color="transparent")
+            prow.pack(fill="x", pady=(6, 2))
+            for text, fill, tcolor in tags:
+                ctk.CTkLabel(prow, text=text, width=104, height=28, corner_radius=14,
+                             font=font(13, "bold"), fg_color=fill, text_color=tcolor
+                             ).pack(side="left", padx=(0, 8))
         if subtitle:
             ctk.CTkLabel(names, text=subtitle, font=font(12), anchor="w",
                          text_color=COLORS["text_muted"]).pack(fill="x")
@@ -515,7 +535,7 @@ class PhotoDialog(ctk.CTkToplevel):
         """Keeps the preview modest: at most ~35% of the screen height, and never taller than what fits."""
         scale = max(self.winfo_fpixels("1i") / 96, 1.0)           # Windows display scaling
         screen_h = self.winfo_screenheight()
-        room = screen_h - 120 - int(210 * scale)                   # minus taskbar/title bar and the controls
+        room = screen_h - 120 - int(245 * scale)                   # minus taskbar/title bar and the controls
         height = max(180, min(room, int(screen_h * 0.35), int(self.PREVIEW_W / aspect)))
         return int(height * aspect)
 
@@ -936,6 +956,21 @@ class UploadWorker(threading.Thread):
 def _is_yes(v):
     return v is True or (isinstance(v, str) and v.strip().lower() in ("y", "yes", "true", "1"))
 
+def folder_tags(folder: str) -> list:
+    """'Math - Scores' -> [('MATH', fill, text), ('SCORES', fill, text)] for the photo window pills."""
+    subj, _, kind = folder.partition(" - ")
+    tags = []
+    for text, table in ((subj, SUBJECT_COLORS), (kind, KIND_COLORS)):
+        if text:
+            fill, tcolor, _edge = table.get(text, PILL_FALLBACK)
+            tags.append((text.upper(), fill, tcolor))
+    return tags
+
+def student_subjects(row: dict) -> list:
+    cols = {k.lower(): k for k in row}
+    return [name for name, col in (("Math", MATH_COL), ("Reading", READING_COL))
+            if col in cols and _is_yes(row[cols[col]])]
+
 def student_photo_info(row: dict) -> dict:
     """Turns a students-table row (from ScannerDB.find_student) into what the photo flow needs."""
     cols = {k.lower(): k for k in row}
@@ -943,8 +978,7 @@ def student_photo_info(row: dict) -> dict:
         raise KeyError(f"Name columns not found; students table has: {sorted(row)}")
     if MATH_COL not in cols and READING_COL not in cols:
         raise KeyError(f"Math/Reading columns not found; students table has: {sorted(row)}")
-    subjects = [name for name, col in (("Math", MATH_COL), ("Reading", READING_COL))
-                if col in cols and _is_yes(row[cols[col]])]
+    subjects = student_subjects(row)
     return {
         "id": str(row["s_id"]),
         "barcode": str(row.get(BARCODE_COL, "")),
@@ -1002,6 +1036,7 @@ class PhotoBrowser(ctk.CTkFrame):
         self._pill_cache = {}           # tuple of days -> PhotoImage (also keeps Tk from dropping them)
         self._pill_slots = 1            # widest day count among students, so all strips match
         self._pill_scale = max(self.winfo_fpixels("1i") / 96, 1.0)
+        self._subjects = {}
         self._day_btns = {}
         self._shown = None              # rows currently displayed (after filters), for the count
         self._refreshing = False
@@ -1076,7 +1111,8 @@ class PhotoBrowser(ctk.CTkFrame):
         box.pack(fill="both", expand=True, padx=(8, 4), pady=(6, 4))
         self.tree = ttk.Treeview(box, columns=("last",), show="tree headings",
                                  selectmode="browse", height=6)
-        self.tree.heading("#0", text="Days  /  Student", anchor="w")
+        self.tree.heading("#0", text="Days · Subjects  /  Student", anchor="w")
+        self.tree.column("#0", width=340, stretch=True)
         self.tree.heading("last", text="Last photo", anchor="e")
         scale = max(self.winfo_fpixels("1i") / 96, 1.0)
         self.tree.column("#0", width=300, stretch=True)
@@ -1284,7 +1320,8 @@ class PhotoBrowser(ctk.CTkFrame):
             self._refreshing = False
             self._loaded_at = time.monotonic()
             self._days = {sid: v[2] for sid, v in visible.items()}
-            self._search = {sid: f"{v[0]} {v[1]} {self._days_text(sid)}".lower()
+            self._subjects = {sid: v[3] for sid, v in visible.items()}
+            self._search = {sid: f"{v[0]} {v[1]} {self._days_text(sid)} {' '.join(sorted(v[3]))}".lower()
                             for sid, v in visible.items()}
             self._pill_slots = max([MIN_PILLS] + [len(v[2]) for v in visible.values()])
             self._pill_cache.clear()
@@ -1341,16 +1378,22 @@ class PhotoBrowser(ctk.CTkFrame):
                 self._set_compare(data)
             self.status.config(text="")
         elif kind == "photo_deleted":
-            _, iid = msg
-            if iid == self.tree.selection():
-                self._pil = None
-                self._pil_id = None
-                self._selected = None
+            _, iid, sid, newest = msg
+            if iid in self.tree.selection():       
+                self._leave_compare_state()
+                self._pil = self._pil_id = self._selected = None
                 self.canvas.delete("all")
                 self.caption.configure(text="")
                 self.open_btn.configure(state="disabled")
                 self.compare_btn.configure(state="disabled")
-            self.tree.delete(iid)
+            if self.tree.exists(iid):
+                self.tree.delete(iid)
+            if sid:
+                if newest:
+                    self._last[sid] = newest
+                else:
+                    self._last.pop(sid, None)      # no photos left: shows as Never / red
+                self._refresh_row(sid)
             self.status.config(text="Photo deleted from Drive")
         elif kind == "error":
             self._loading.clear()
@@ -1403,34 +1446,30 @@ class PhotoBrowser(ctk.CTkFrame):
         if not meta or meta.get("kind") != "photo":
             self.status.config(text="Select a photo to delete")
             return
-        
-        # Confirmation popup
         if not messagebox.askyesno(
-            "Delete Photo", 
+            "Delete Photo",
             "Are you sure you want to permanently delete this photo from Google Drive?",
             parent=self
         ):
             return
-
         store = self.get_store()
         if store is None:
             self.status.config(text="Drive not connected")
             return
 
-        file_id = meta["id"]
-        try:
-            # Delete from Google Drive in the background
-            def do_delete():
-                try:
-                    store.svc.files().delete(fileId=file_id).execute()
-                    self._q.put(("photo_deleted", sel[0]))
-                except Exception as e:
-                    self._q.put(("error", f"Delete failed: {e}"))
-            
-            self.status.config(text="Deleting photo...")
-            self._run(do_delete)
-        except Exception as e:
-            self.status.config(text=f"Delete failed: {e}")
+        iid, file_id = sel[0], meta["id"]
+        student_iid = self.tree.parent(self.tree.parent(iid))     # photo -> folder -> student
+        smeta = self.meta.get(student_iid) or {}
+        sid, student_folder = smeta.get("student_id"), smeta.get("id")
+
+        def do_delete():
+            store.delete_photo(file_id)
+            newest = (store.backfill_last_photo(student_folder, clear_if_empty=True)
+                      if student_folder else None)
+            return ("photo_deleted", iid, sid, newest)
+
+        self.status.config(text="Deleting photo...")
+        self._run(do_delete)
 
     def apply_thresholds(self, warn, bad):
         self.warn_days, self.bad_days = warn, bad
@@ -1624,24 +1663,35 @@ class PhotoBrowser(ctk.CTkFrame):
     def _pill_img(self, sid):
         have = tuple(d for d in DAY_NAMES if d in self._days.get(sid, set()))
         days = have + ("n/a",) * max(0, MIN_PILLS - len(have))
-        img = self._pill_cache.get(days)
+        subs = tuple(s for s in SUBJECT_ORDER if s in self._subjects.get(sid, set()))
+        key = (days, subs)
+        img = self._pill_cache.get(key)
         if img is None:
             k, s = 3, self._pill_scale                     # draw 3x, then shrink for smooth edges
             pw, ph, gap = int(34 * s), int(18 * s), int(4 * s)
+            sw = int(22 * s)                               # subject pills are a single letter
             slots = max(self._pill_slots, MIN_PILLS)
-            pad = int(12 * s)                       # blank space between the pills and the name
-            width = slots * (pw + gap) - gap + pad
+            pad = int(12 * s)
+            days_w = slots * (pw + gap) - gap
+            subs_x = days_w + int(8 * s)
+            width = subs_x + len(SUBJECT_ORDER) * (sw + gap) - gap + pad
             canvas = Image.new("RGBA", (width * k, ph * k), (0, 0, 0, 0))
             draw = ImageDraw.Draw(canvas)
             fnt = _pill_font(int(ph * k * 0.58))
+
+            def pill(x0, w, text, colors):
+                fill, tcolor, edge = colors
+                draw.rounded_rectangle((x0 * k, 0, (x0 + w) * k - 1, ph * k - 1),
+                                       radius=ph * k // 2, fill=fill, outline=edge, width=k)
+                draw.text(((x0 + w / 2) * k, ph * k / 2), text, font=fnt, fill=tcolor, anchor="mm")
+
             for i, d in enumerate(days):
-                fill, text, edge = PILL_COLORS.get(d, PILL_FALLBACK)
-                x0 = i * (pw + gap) * k
-                draw.rounded_rectangle((x0, 0, x0 + pw * k - 1, ph * k - 1), radius=ph * k // 2,
-                                       fill=fill, outline=edge, width=k)
-                draw.text((x0 + pw * k / 2, ph * k / 2), d, font=fnt, fill=text, anchor="mm")
+                pill(i * (pw + gap), pw, d, PILL_COLORS.get(d, PILL_FALLBACK))
+            for j, name in enumerate(SUBJECT_ORDER):
+                if name in subs:                           # missing subject = blank slot, columns stay aligned
+                    pill(subs_x + j * (sw + gap), sw, SUBJECT_LETTER[name], SUBJECT_COLORS[name])
             img = ImageTk.PhotoImage(canvas.resize((width, ph), Image.LANCZOS))
-            self._pill_cache[days] = img
+            self._pill_cache[key] = img
         return img
 
     def _toggle_day(self, day):
