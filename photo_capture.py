@@ -67,6 +67,7 @@ TOKEN_FILE = os.path.join(BASE, "token.json")
 # students table columns 
 BARCODE_COL, FIRST_COL, LAST_COL = "barcode_code", "first_name", "last_name"
 MATH_COL, READING_COL = "math", "reading"  # a Y (or true) means the student does that subject
+SHOT_TYPES = [("Planning", False), ("Scores", True)]   # (folder suffix, allow several photos)
 
 LAST_KEY = "last_photo"   # appProperties key on each student folder, e.g. 2026-10-21T14:03:11
 SORT_OPTIONS = ["A–Z", "Longest ago", "Most recent"]
@@ -308,7 +309,7 @@ class PhotoDialog(ctk.CTkToplevel):
     PREVIEW_W = 640  # raise to ~800 for a bigger preview if the screen allows
 
     def __init__(self, parent, label, on_done, stream, confirm=CONFIRM_PHOTO, subtitle="",
-                theme=None, zoom=1.0, on_zoom=None):
+                theme=None, zoom=1.0, on_zoom=None, multi=False):
         super().__init__(parent)
         self.withdraw()
         self.configure(fg_color=COLORS["bg"])
@@ -319,6 +320,7 @@ class PhotoDialog(ctk.CTkToplevel):
         self.zoom, self._start_zoom, self.on_zoom = zoom, zoom, on_zoom
         self._tick_job = self._act_job = None
         self.stream = stream
+        self.multi = multi
 
         if not stream.ok:
             messagebox.showerror("Camera", "Camera not found", parent=parent)
@@ -381,9 +383,13 @@ class PhotoDialog(ctk.CTkToplevel):
         self.buttons = {
             "capture": btn("Capture", self.capture, "primary"),
             "keep": btn("Keep", self.keep, "success"),
+            "more": btn("Keep + more", self.keep_more, "success"),
             "retake": btn("Retake", self.retake, "secondary"),
-            "cancel": btn("Cancel", lambda: self.finish(None), "secondary"),
+            "cancel": btn("Skip", lambda: self.finish(None), "secondary"),
         }
+
+        # key binding, next to the others
+        self.bind("<a>", lambda e: self.keep_more())
         self.hint = ctk.CTkLabel(card, text="", font=font(11), text_color=COLORS["text_muted"])
         self.hint.pack(pady=(0, 16))
         self._set_mode(reviewing=False)
@@ -426,12 +432,16 @@ class PhotoDialog(ctk.CTkToplevel):
         if reviewing:
             self.box.configure(border_color=COLORS["warning"])
             self.state_label.configure(text="REVIEW", fg_color=COLORS["warning"], text_color="#1c1203")
-            self.hint.configure(text="Enter = keep      R = retake      Esc = cancel")
-            self._layout(["keep", "retake", "cancel"])
+            if self.multi:
+                self.hint.configure(text="Enter = keep      A = keep + take another      R = retake      Esc = skip")
+                self._layout(["keep", "more", "retake", "cancel"])
+            else:
+                self.hint.configure(text="Enter = keep      R = retake      Esc = skip")
+                self._layout(["keep", "retake", "cancel"])
         else:
             self.box.configure(border_color=COLORS["success"])
             self.state_label.configure(text="●  LIVE", fg_color=COLORS["success"], text_color="#052e16")
-            self.hint.configure(text="Space = capture      Esc = cancel")
+            self.hint.configure(text="Space = capture      Esc = skip")
             self._layout(["capture", "cancel"])
 
     def _crop(self, frame):
@@ -481,7 +491,12 @@ class PhotoDialog(ctk.CTkToplevel):
             self.frozen = False
             self._set_mode(reviewing=False)
 
-    def finish(self, result):
+    def keep_more(self):
+        if self.frozen and self.multi:
+            self.finish(_jpeg(self.shot), again=True)
+
+
+    def finish(self, result, again=False):
         if self.closed:
             return
         self.closed = True
@@ -494,7 +509,7 @@ class PhotoDialog(ctk.CTkToplevel):
         if self.on_zoom and self.zoom != self._start_zoom:
             self.on_zoom(self.zoom)
         self.destroy()
-        self.on_done(result)
+        self.on_done(result, again)
 
     def _fit_preview_width(self, aspect):
         """Keeps the preview modest: at most ~35% of the screen height, and never taller than what fits."""
@@ -936,6 +951,7 @@ def student_photo_info(row: dict) -> dict:
         "first": row[FIRST_COL],
         "last": row[LAST_COL],
         "subjects": subjects,
+        "steps": [(f"{s} - {kind}", multi) for s in subjects for kind, multi in SHOT_TYPES],
     }
 
 # -------------------- External opening files functionality -----
@@ -988,6 +1004,8 @@ class PhotoBrowser(ctk.CTkFrame):
         self._pill_scale = max(self.winfo_fpixels("1i") / 96, 1.0)
         self._day_btns = {}
         self._shown = None              # rows currently displayed (after filters), for the count
+        self._refreshing = False
+        self._loaded_at = None        
 
         self.sort_var = tk.StringVar(value=SORT_OPTIONS[0])
         self.overdue_var = tk.BooleanVar(value=False) 
@@ -1155,27 +1173,28 @@ class PhotoBrowser(ctk.CTkFrame):
     # --- loading ---
 
     def refresh(self):
+        if self._refreshing:
+            return
         store = self.get_store()
         if store is None:
             self.status.config(text="Drive not connected")
             return
-        try:
-            visible = self.get_visible_students()
-        except Exception as e:
-            self.status.config(text=f"Student list failed: {e}")
-            return
-
-        self._days = {sid: v[2] for sid, v in visible.items()}
-        self._search = {sid: f"{v[0]} {v[1]} {self._days_text(sid)}".lower() for sid, v in visible.items()}
-        self._pill_slots = max([MIN_PILLS] + [len(v[2]) for v in visible.values()])
-        self._pill_cache.clear()
+        self._refreshing = True
         self.tree.delete(*self.tree.get_children())
         self.meta.clear()
         self._loading.clear()
         self.status.config(text="Loading...")
-        self._run(self._fetch_root, store, visible)
+        self._run(self._fetch_root, store)
 
-    def _fetch_root(self, store, visible):
+    def refresh_if_stale(self, max_age=600):
+        """Loads on first use, and again if the list is more than max_age seconds old."""
+        if self._refreshing:
+            return
+        if self._loaded_at is None or time.monotonic() - self._loaded_at > max_age:
+            self.refresh()
+
+    def _fetch_root(self, store):
+        visible = self.get_visible_students() 
         rows, last, missing, seen = [], {}, [], set()
         for f in store.list_children(store.root_id, folders_only=True):
             props = f.get("appProperties") or {}
@@ -1192,7 +1211,7 @@ class PhotoBrowser(ctk.CTkFrame):
         for sid, info in visible.items():      # no Drive folder yet = never photographed
             if sid not in seen:
                 rows.append((info[0], None, sid))
-        return ("root", rows, last, missing)
+        return ("root", rows, last, missing, visible)
 
     def _on_open(self, event):
         iid = self.tree.focus()
@@ -1261,7 +1280,14 @@ class PhotoBrowser(ctk.CTkFrame):
             return
         kind = msg[0]
         if kind == "root":
-            _, self._rows, self._last, missing = msg
+            _, self._rows, self._last, missing, visible = msg
+            self._refreshing = False
+            self._loaded_at = time.monotonic()
+            self._days = {sid: v[2] for sid, v in visible.items()}
+            self._search = {sid: f"{v[0]} {v[1]} {self._days_text(sid)}".lower()
+                            for sid, v in visible.items()}
+            self._pill_slots = max([MIN_PILLS] + [len(v[2]) for v in visible.values()])
+            self._pill_cache.clear()
             store = self.get_store() if missing else None
             self._checking = {sid for sid, _ in missing} if store is not None else set()
             self._populate_root()

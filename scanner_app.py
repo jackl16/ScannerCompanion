@@ -961,6 +961,7 @@ class ScannerApp(ctk.CTk):
             self.hero.pack_forget()
             self._ensure_photo_widgets()
             self.photo_browser.pack(fill="both", expand=True, padx=20, pady=(8, 0), before=self.log_frame)
+            self.after(300, self.photo_browser.refresh_if_stale)
             self.log_frame.pack(fill="both", expand=False, padx=20, pady=(8, 12))
             self.log_list.configure(height=130)
             self.resizable(True, True)
@@ -1097,43 +1098,52 @@ class ScannerApp(ctk.CTk):
             return
 
         self._play_feedback_sound(is_success=True)
-        self.status_label.config(text=f"Found: {label} ({' + '.join(subjects)})", fg=COLORS["success"])
+        steps = list(info["steps"])
+        total = len(steps)
         self._photo_busy = True
-        total = len(subjects)
+        self.status_label.config(text=f"Found: {label} ({' + '.join(subjects)})", fg=COLORS["success"])
 
-
-        def next_subject():
-            if not subjects:
+        def next_step():
+            if not steps:
                 self._photo_busy = False
                 self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
-                if hasattr(self, "photo_search_entry") and self.photo_search_entry.winfo_exists():
-                    self.photo_search_entry.focus_set()
                 return
-            subject = subjects.pop(0)
+            folder, multi = steps.pop(0)
+            taken = 0
 
-            def done(jpeg):
-                if jpeg:
-                    self.photo_worker.submit(info["id"], info["last"], info["first"], subject, jpeg, info["barcode"])
-                    self._log(f"📷 {label}: {subject} photo captured, uploading")
-                else:
-                    self._log(f"{label}: {subject} photo skipped")
-                next_subject()
+            def open_dialog():
+                def done(jpeg, again=False):
+                    nonlocal taken
+                    if jpeg:
+                        taken += 1
+                        self.photo_worker.submit(info["id"], info["last"], info["first"],
+                                                 folder, jpeg, info["barcode"])
+                        self._log(f"📷 {label}: {folder} photo {taken} captured, uploading")
+                    else:
+                        self._log(f"{label}: {folder} skipped")
+                    if jpeg and again:
+                        open_dialog()
+                    else:
+                        next_step()
 
-            try:
-                step = total - len(subjects)  # subject was just popped, so this is 1-based
-                PhotoDialog(
-                    self, label, done,
-                    stream=self._get_camera(),
-                    subtitle=subject if total == 1 else f"{subject}  •  photo {step} of {total}",
-                    theme={"colors": COLORS, "font": FONT},
-                    zoom=self.db.camera_zoom, on_zoom=self.db.save_camera_zoom,
-                )
-            except Exception as e:
-                self._photo_busy = False
-                self._log(f"Camera error: {e}")
+                step_no = total - len(steps)
+                subtitle = f"{folder}  •  step {step_no} of {total}"
+                if taken:
+                    subtitle += f"  •  photo {taken + 1}"
+                try:
+                    PhotoDialog(
+                        self, label, done,
+                        stream=self._get_camera(), subtitle=subtitle, multi=multi,
+                        theme={"colors": COLORS, "font": FONT},
+                        zoom=self.db.camera_zoom, on_zoom=self.db.save_camera_zoom,
+                    )
+                except Exception as e:
+                    self._photo_busy = False
+                    self._log(f"Camera error: {e}")
 
-        next_subject()
+            open_dialog()
 
+        next_step()
 
     def _on_tk_error(self, exc, val, tb):
         """Any error inside a button/timer callback: log it, tell the user once a minute, keep running."""
