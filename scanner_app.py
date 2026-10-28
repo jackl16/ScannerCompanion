@@ -969,6 +969,8 @@ class ScannerApp(ctk.CTk):
             self.geometry("1100x760")
         else:
             self.mode_label.config(text="")
+            if self._widget_alive("photo_browser"):
+                self.photo_browser.pack_forget()
             self.hero.pack(fill="x", padx=20, pady=(16, 8), before=self.info_row)
             self.log_frame.pack(fill="both", expand=True, padx=20, pady=(8, 16))
             self.log_list.configure(height=220)
@@ -1086,16 +1088,17 @@ class ScannerApp(ctk.CTk):
         label = f"{info['first']}, {info['last']}"
         subjects = list(info["subjects"])
         if not subjects:
-            if not self._get_camera().ok:
-                self._release_camera()
-                self._play_feedback_sound(is_success=False)
-                messagebox.showerror("Camera", "Camera not found. Check the cable, or pick another "
-                                            "under Settings > Choose Camera.")
-                return
             self._play_feedback_sound(is_success=False)
             msg = f"{label}: no Math or Reading marked"
             self.status_label.config(text=msg, fg=COLORS["warning"])
             self._log(msg)
+            return
+
+        if not self._get_camera().ok:
+            self._release_camera()
+            self._play_feedback_sound(is_success=False)
+            messagebox.showerror("Camera", "Camera not found. Check the cable, or pick another "
+                                           "under Settings > Choose Camera.")
             return
 
         self._play_feedback_sound(is_success=True)

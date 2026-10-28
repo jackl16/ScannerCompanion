@@ -1112,10 +1112,9 @@ class PhotoBrowser(ctk.CTkFrame):
         self.tree = ttk.Treeview(box, columns=("last",), show="tree headings",
                                  selectmode="browse", height=6)
         self.tree.heading("#0", text="Days · Subjects  /  Student", anchor="w")
-        self.tree.column("#0", width=340, stretch=True)
+        self.tree.column("#0", width=300, stretch=True)
         self.tree.heading("last", text="Last photo", anchor="e")
         scale = max(self.winfo_fpixels("1i") / 96, 1.0)
-        self.tree.column("#0", width=300, stretch=True)
         self.tree.column("last", width=int(150 * scale), anchor="e", stretch=False)
         self.tree.tag_configure("warn", foreground=COLORS["warning"])
         self.tree.tag_configure("stale", foreground=COLORS["error"])
