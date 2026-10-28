@@ -1076,7 +1076,7 @@ class PhotoBrowser(ctk.CTkFrame):
 
         frow = ctk.CTkFrame(left, fg_color="transparent")
         frow.pack(fill="x", padx=12, pady=(8, 0))
-        ctk.CTkCheckBox(frow, text="Overdue", variable=self.overdue_var, width=90,
+        ctk.CTkCheckBox(frow, text="Alerts Only", variable=self.overdue_var, width=90,
                         command=self._populate_root, font=font(12),
                         checkbox_width=18, checkbox_height=18, corner_radius=5, border_width=2,
                         border_color=COLORS["text_muted"], fg_color=COLORS["primary"],
@@ -1688,8 +1688,11 @@ class PhotoBrowser(ctk.CTkFrame):
             for i, d in enumerate(days):
                 pill(i * (pw + gap), pw, d, PILL_COLORS.get(d, PILL_FALLBACK))
             for j, name in enumerate(SUBJECT_ORDER):
-                if name in subs:                           # missing subject = blank slot, columns stay aligned
-                    pill(subs_x + j * (sw + gap), sw, SUBJECT_LETTER[name], SUBJECT_COLORS[name])
+                x0 = subs_x + j * (sw + gap)
+                if name in subs:
+                    pill(x0, sw, SUBJECT_LETTER[name], SUBJECT_COLORS[name])
+                else:
+                    pill(x0, sw, "–", PILL_COLORS["n/a"])      # student doesn't have this subject
             img = ImageTk.PhotoImage(canvas.resize((width, ph), Image.LANCZOS))
             self._pill_cache[key] = img
         return img
