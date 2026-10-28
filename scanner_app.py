@@ -960,7 +960,6 @@ class ScannerApp(ctk.CTk):
             self.mode_label.config(text="📷 PHOTO MODE (no check-in)", fg=COLORS["warning"])
             self.hero.pack_forget()
             self._ensure_photo_widgets()
-            self.photo_search_frame.pack(fill="x", padx=20, pady=(12, 0), before=self.log_frame)
             self.photo_browser.pack(fill="both", expand=True, padx=20, pady=(8, 0), before=self.log_frame)
             self.log_frame.pack(fill="both", expand=False, padx=20, pady=(8, 12))
             self.log_list.configure(height=130)
@@ -969,9 +968,6 @@ class ScannerApp(ctk.CTk):
             self.geometry("1100x760")
         else:
             self.mode_label.config(text="")
-            for name in ("photo_search_frame", "photo_browser"):
-                if self._widget_alive(name):
-                    getattr(self, name).pack_forget()
             self.hero.pack(fill="x", padx=20, pady=(16, 8), before=self.info_row)
             self.log_frame.pack(fill="both", expand=True, padx=20, pady=(8, 16))
             self.log_list.configure(height=220)
@@ -980,8 +976,6 @@ class ScannerApp(ctk.CTk):
             self.geometry(NORMAL_SIZE)
 
     def _ensure_photo_widgets(self):
-        if not self._widget_alive("photo_search_frame"):
-            self._build_photo_search_bar()
         if not self._widget_alive("photo_browser"):
             self._build_photo_browser()
 
