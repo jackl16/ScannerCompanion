@@ -139,6 +139,7 @@ class ScannerDB:
         self.log_terminal = bool(appearance_cfg.get("log_terminal", False))
 
         self.camera_index = int(config.get("camera", {}).get("index", 0))
+        self.camera_zoom = float(config.get("camera", {}).get("zoom", 1.0))
 
         self._last_scan_id = None
         self._last_scan_time = 0
@@ -340,6 +341,12 @@ class ScannerDB:
         config.setdefault("camera", {})["index"] = int(index)
         save_config(config)
         self.camera_index = int(index)
+        
+    def save_camera_zoom(self, zoom: float) -> None:
+        config = load_config()
+        config.setdefault("camera", {})["zoom"] = float(zoom)
+        save_config(config)
+        self.camera_zoom = float(zoom)
 
     # --- features ----
     def unlock_photo_feature(self) -> None:

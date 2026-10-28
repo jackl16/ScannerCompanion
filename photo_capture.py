@@ -307,7 +307,8 @@ class PhotoDialog(ctk.CTkToplevel):
 
     PREVIEW_W = 640  # raise to ~800 for a bigger preview if the screen allows
 
-    def __init__(self, parent, label, on_done, confirm=CONFIRM_PHOTO, subtitle="", theme=None, camera_index=CAMERA_INDEX):
+    def __init__(self, parent, label, on_done, stream, confirm=CONFIRM_PHOTO, subtitle="",
+                theme=None, zoom=1.0, on_zoom=None):
         super().__init__(parent)
         self.withdraw()
         self.configure(fg_color=COLORS["bg"])
@@ -315,17 +316,14 @@ class PhotoDialog(ctk.CTkToplevel):
         self.resizable(False, False)
         self.on_done, self.confirm = on_done, confirm
         self.shot, self.frozen, self.closed = None, False, False
-        self.zoom = 1.0
+        self.zoom, self._start_zoom, self.on_zoom = zoom, zoom, on_zoom
         self._tick_job = self._act_job = None
-        self.cam = _open_camera(camera_index)
+        self.stream = stream
 
-        if not self.cam.isOpened():
+        if not stream.ok:
             messagebox.showerror("Camera", "Camera not found", parent=parent)
             self.finish(None)
             return
-
-        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
         card = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=16,
                             border_width=1, border_color=COLORS["border"])
@@ -348,8 +346,7 @@ class PhotoDialog(ctk.CTkToplevel):
         self.box = ctk.CTkFrame(card, fg_color=COLORS["bg"], corner_radius=12,
                                 border_width=3, border_color=COLORS["success"])
         self.box.pack(padx=20)
-        cam_w = int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
-        cam_h = int(self.cam.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+        cam_w, cam_h = stream.size()
         self.preview_w = self._fit_preview_width(cam_w / cam_h)
         self._pv_h = int(self.preview_w * cam_h / cam_w)
         self._blank = tk.PhotoImage(width=self.preview_w, height=self._pv_h)
@@ -362,9 +359,9 @@ class PhotoDialog(ctk.CTkToplevel):
                      text_color=COLORS["text_muted"]).pack(side="left", padx=(0, 10))
         self.zoom_slider = ctk.CTkSlider(zrow, from_=1.0, to=4.0, number_of_steps=30, width=300,
                                          progress_color=COLORS["primary"], command=self._set_zoom)
-        self.zoom_slider.set(1.0)
+        self.zoom_slider.set(self.zoom)
         self.zoom_slider.pack(side="left")
-        self.zoom_label = ctk.CTkLabel(zrow, text="1.0×", width=44, font=font(12, "bold"),
+        self.zoom_label = ctk.CTkLabel(zrow, text=f"{self.zoom:.1f}×", width=44, font=font(12, "bold"),
                                        text_color=COLORS["text"])
         self.zoom_label.pack(side="left", padx=(10, 0))
 
@@ -457,14 +454,14 @@ class PhotoDialog(ctk.CTkToplevel):
         if self.closed:
             return
         if not self.frozen:
-            ok, frame = self.cam.read()
-            if ok:
+            frame = self.stream.latest()
+            if frame is not None:
                 frame = self._crop(frame)
                 self.shot = frame
                 small = cv2.resize(frame, (self.preview_w, self._pv_h))
                 self._photo_img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
-                self.view.configure(image=self._photo_img)  # keep a reference or Tk drops the image
-        self._tick_job = self.after(30, self._tick)
+                self.view.configure(image=self._photo_img)
+        self._tick_job = self.after(40, self._tick)   # ~25 fps is plenty for framing a page
 
     def capture(self):
         if self.shot is None or self.frozen:
@@ -494,7 +491,8 @@ class PhotoDialog(ctk.CTkToplevel):
                     self.after_cancel(job)
                 except Exception:
                     pass
-        self.cam.release()
+        if self.on_zoom and self.zoom != self._start_zoom:
+            self.on_zoom(self.zoom)
         self.destroy()
         self.on_done(result)
 
@@ -641,6 +639,61 @@ class ContextMenu(ctk.CTkToplevel):
         self.destroy()
 
 
+class CameraStream:
+    """Keeps one camera open; a background thread always holds the newest frame."""
+    def __init__(self, index):
+        self.index = index
+        self.cap = _open_camera(index)
+        self.ok = self.cap.isOpened()
+        self._frame, self._lock, self._stop = None, threading.Lock(), threading.Event()
+        self.count = 0
+        self.last_used = time.monotonic()
+        self._thread = None
+        if not self.ok:
+            return
+        self._configure(mjpg=True)
+        if not self.cap.read()[0]:           # camera didn't like MJPG: reopen and use its default
+            self.cap.release()
+            self.cap = _open_camera(index)
+            self.ok = self.cap.isOpened()
+            if not self.ok:
+                return
+            self._configure(mjpg=False)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _configure(self, mjpg):
+        if mjpg:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # before size
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    def _loop(self):
+        while not self._stop.is_set():
+            ok, frame = self.cap.read()
+            if ok:
+                with self._lock:
+                    self._frame = frame
+                self.count += 1
+            else:
+                time.sleep(0.05)
+
+    def latest(self):
+        self.last_used = time.monotonic()
+        with self._lock:
+            return self._frame
+
+    def size(self):
+        return (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640),
+                int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480))
+
+    def close(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        self.cap.release()
+        
 class CameraPicker(ctk.CTkToplevel):
     """Cycles through connected cameras with a live preview; the user picks the one to use."""
 
@@ -1719,3 +1772,5 @@ class PhotoBrowser(ctk.CTkFrame):
             if items:
                 ContextMenu(self, items, event.x_root, event.y_root)
             return "break"
+
+    

@@ -335,7 +335,7 @@ class ScannerApp(ctk.CTk):
         self._photo_toggle_added = False
         self._photo_busy = False
         self.photo_worker = None
-
+        self.camera_stream = None
 
         self.scan_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -851,6 +851,9 @@ class ScannerApp(ctk.CTk):
         try:
             self._retry_pending_photos()
             self._update_pending_label()
+            s = self.camera_stream
+            if s and not self._photo_busy and time.monotonic() - s.last_used > 120:
+                self._release_camera()      # don't decode 1080p all day on a weak laptop
         except Exception:
             log.exception("Periodic sync error")
         finally:
@@ -935,12 +938,16 @@ class ScannerApp(ctk.CTk):
                 "While this is on, scans will NOT check students in or out.\n"
                 "They will only open the camera for that student.\n\nTurn it on?"
             ) or not self._ensure_photo_backend():
+                self._release_camera()
                 self.photo_mode_var.set(False)
                 enabled = False
         self.db.save_photo_mode(enabled)
+        self._release_camera()
         self._refresh_mode_indicator()
         self._log("📷 Photo mode ON - scans find students for photos, no check-in/out" if enabled
                   else "Photo mode OFF - scans check students in/out")
+        if enabled: 
+            self.after(200, self._get_camera)
 
     def _widget_alive(self, name):
         w = getattr(self, name, None)
@@ -1083,6 +1090,12 @@ class ScannerApp(ctk.CTk):
         label = f"{info['first']}, {info['last']}"
         subjects = list(info["subjects"])
         if not subjects:
+            if not self._get_camera().ok:
+                self._release_camera()
+                self._play_feedback_sound(is_success=False)
+                messagebox.showerror("Camera", "Camera not found. Check the cable, or pick another "
+                                            "under Settings > Choose Camera.")
+                return
             self._play_feedback_sound(is_success=False)
             msg = f"{label}: no Math or Reading marked"
             self.status_label.config(text=msg, fg=COLORS["warning"])
@@ -1116,9 +1129,10 @@ class ScannerApp(ctk.CTk):
                 step = total - len(subjects)  # subject was just popped, so this is 1-based
                 PhotoDialog(
                     self, label, done,
+                    stream=self._get_camera(),
                     subtitle=subject if total == 1 else f"{subject}  •  photo {step} of {total}",
                     theme={"colors": COLORS, "font": FONT},
-                    camera_index=self.db.camera_index,
+                    zoom=self.db.camera_zoom, on_zoom=self.db.save_camera_zoom,
                 )
             except Exception as e:
                 self._photo_busy = False
@@ -1229,6 +1243,11 @@ class ScannerApp(ctk.CTk):
             def camera():
                 if self._photo_busy:
                     return "in use right now (skipped)"
+                s = self.camera_stream
+                if s is not None:
+                    if s.latest() is None:
+                        raise RuntimeError("camera open but no frames yet")
+                    return "streaming"
                 if not test_camera(self.db.camera_index):
                     raise RuntimeError("no image from the selected camera")
 
@@ -1242,6 +1261,7 @@ class ScannerApp(ctk.CTk):
         if self._photo_busy:
             messagebox.showinfo("Choose Camera", "Finish the current photo first.")
             return
+        self._release_camera()
         from photo_capture import CameraPicker
 
         def picked(index):
@@ -1280,6 +1300,7 @@ class ScannerApp(ctk.CTk):
         self.config(cursor="watch")
         self.update_idletasks()
         try:
+            self._release_camera()
             self._finish_photo_uploads()            # let queued uploads finish first
             if self.photo_worker is not None:
                 self.photo_worker.stop()
@@ -1671,6 +1692,7 @@ class ScannerApp(ctk.CTk):
         with open(bat_path, "w") as f:
             f.write(bat)
         subprocess.Popen([bat_path], shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        self._release_camera()
         self.stop_event.set()
         self.probe_stop_event.set()
         self.db.stop()
@@ -1694,6 +1716,21 @@ class ScannerApp(ctk.CTk):
         except Exception:
             pass  # fail silently if audio drivers are locked down
 
+    def _get_camera(self):
+        from photo_capture import CameraStream
+        s = self.camera_stream
+        if s is None or not s.ok or s.index != self.db.camera_index:   # ok check: retry a dead camera
+            self._release_camera()
+            s = self.camera_stream = CameraStream(self.db.camera_index)
+        return s
+
+    def _release_camera(self):
+        s = getattr(self, "camera_stream", None)
+        if s:
+            s.close()
+            self.camera_stream = None
+
+
     def _cancel_scanner_loops(self):
         for job in (self._poll_job, self._flush_job):
             if job is not None:
@@ -1715,6 +1752,7 @@ class ScannerApp(ctk.CTk):
             widget.destroy()
     def _on_close(self):
         self._finish_photo_uploads()
+        self._release_camera()
         self.stop_event.set()
         self.probe_stop_event.set()
         self.db.stop()  # stop the token-refresh background thread too
