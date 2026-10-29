@@ -1322,7 +1322,8 @@ class PhotoBrowser(ctk.CTkFrame):
             self._subjects = {sid: v[3] for sid, v in visible.items()}
             self._search = {sid: f"{v[0]} {v[1]} {self._days_text(sid)} {' '.join(sorted(v[3]))}".lower()
                             for sid, v in visible.items()}
-            self._pill_slots = max([MIN_PILLS] + [len(v[2]) for v in visible.values()])
+            #self._pill_slots = max([MIN_PILLS] + [len(v[2]) for v in visible.values()])
+            self._pill_slots = MIN_PILLS
             self._pill_cache.clear()
             store = self.get_store() if missing else None
             self._checking = {sid for sid, _ in missing} if store is not None else set()
@@ -1660,7 +1661,7 @@ class PhotoBrowser(ctk.CTkFrame):
         return " ".join(d for d in DAY_NAMES if d in days)
 
     def _pill_img(self, sid):
-        have = tuple(d for d in DAY_NAMES if d in self._days.get(sid, set()))
+        have = tuple(d for d in DAY_NAMES if d in self._days.get(sid, set()))[:2]
         days = have + ("n/a",) * max(0, MIN_PILLS - len(have))
         subs = tuple(s for s in SUBJECT_ORDER if s in self._subjects.get(sid, set()))
         key = (days, subs)

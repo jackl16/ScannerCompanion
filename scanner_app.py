@@ -966,7 +966,7 @@ class ScannerApp(ctk.CTk):
             self.log_list.configure(height=130)
             self.resizable(True, True)
             self.minsize(960, 640)
-            self.geometry("1100x760")
+            self.geometry("960x760")
         else:
             self.mode_label.config(text="")
             if self._widget_alive("photo_browser"):

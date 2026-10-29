@@ -453,13 +453,15 @@ class ScannerDB:
         while True:
             rows = (
                 self.client.table("student_schedule")
-                .select("s_id, day_of_week")
+                .select("s_id, day_of_week","makeup_date")
                 # .eq("center_id", self.center_id)   # uncomment if student_schedule has this column
                 .order("s_id").order("day_of_week")
                 .range(start, start + page - 1)
                 .execute().data
             )
             for r in rows:
+                if r.get("makeup_date") is not None and r.get("makeup_date") != "":
+                    continue
                 d = _norm_day(r.get("day_of_week"))
                 if d:
                     out.setdefault(str(r["s_id"]), set()).add(d)
