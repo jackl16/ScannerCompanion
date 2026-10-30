@@ -140,6 +140,10 @@ class ScannerDB:
 
         self.camera_index = int(config.get("camera", {}).get("index", 0))
         self.camera_zoom = float(config.get("camera", {}).get("zoom", 1.0))
+        self.camera_width = int(config.get("camera", {}).get("width", 1920))
+        self.camera_height = int(config.get("camera", {}).get("height", 1080))
+        self.camera_fps = int(config.get("camera", {}).get("fps", 15))
+
 
         self._last_scan_id = None
         self._last_scan_time = 0
@@ -347,6 +351,13 @@ class ScannerDB:
         config.setdefault("camera", {})["zoom"] = float(zoom)
         save_config(config)
         self.camera_zoom = float(zoom)
+
+    def save_camera_settings(self, width: int, height: int, fps: int) -> None:
+        config = load_config()
+        cam = config.setdefault("camera", {})
+        cam["width"], cam["height"], cam["fps"] = int(width), int(height), int(fps)
+        save_config(config)
+        self.camera_width, self.camera_height, self.camera_fps = int(width), int(height), int(fps)
 
     # --- features ----
     def unlock_photo_feature(self) -> None:

@@ -309,6 +309,17 @@ class DriveStore:
                 ).execute()
         return newest
 
+def paint_preview(frame, tkimg, w, h, fast=True):
+    """Draws a camera frame into an existing PhotoImage. fast=False is the old, heavier way (for comparing)."""
+    if fast:
+        step = max(1, frame.shape[1] // w)
+        small = frame[::step, ::step]                  # a strided view: costs nothing
+        if small.shape[1] != w or small.shape[0] != h:
+            small = cv2.resize(small, (w, h))
+    else:
+        small = cv2.resize(frame, (w, h))              # resizes the full frame every time
+    tkimg.paste(Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
+
 
 def _jpeg(frame):
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -333,6 +344,8 @@ class PhotoDialog(ctk.CTkToplevel):
         self.zoom, self._start_zoom, self.on_zoom = zoom, zoom, on_zoom
         self._tick_job = self._act_job = None
         self.stream = stream
+        self._last_count = -1
+        self._tick_ms = max(15, int(500 / stream.want[2]))    # check twice per camera frame
         self.multi = multi
 
         if not stream.ok:
@@ -371,8 +384,8 @@ class PhotoDialog(ctk.CTkToplevel):
         cam_w, cam_h = stream.size()
         self.preview_w = self._fit_preview_width(cam_w / cam_h)
         self._pv_h = int(self.preview_w * cam_h / cam_w)
-        self._blank = tk.PhotoImage(width=self.preview_w, height=self._pv_h)
-        self.view = tk.Label(self.box, image=self._blank, bg=COLORS["bg"], bd=0)
+        self._tkimg = ImageTk.PhotoImage(Image.new("RGB", (self.preview_w, self._pv_h), COLORS["bg"]))
+        self.view = tk.Label(self.box, image=self._tkimg, bg=COLORS["bg"], bd=0)
         self.view.pack(padx=6, pady=6)
 
         zrow = ctk.CTkFrame(card, fg_color="transparent")
@@ -483,15 +496,16 @@ class PhotoDialog(ctk.CTkToplevel):
     def _tick(self):
         if self.closed:
             return
-        if not self.frozen:
+        t0 = time.monotonic()
+        if not self.frozen and self.stream.count != self._last_count:
             frame = self.stream.latest()
             if frame is not None:
+                self._last_count = self.stream.count
                 frame = self._crop(frame)
-                self.shot = frame
-                small = cv2.resize(frame, (self.preview_w, self._pv_h))
-                self._photo_img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
-                self.view.configure(image=self._photo_img)
-        self._tick_job = self.after(40, self._tick)   # ~25 fps is plenty for framing a page
+                self.shot = frame                         # full-res, this is what gets saved
+                paint_preview(frame, self._tkimg, self.preview_w, self._pv_h)
+        spent = int((time.monotonic() - t0) * 1000)
+        self._tick_job = self.after(max(15, self._tick_ms - spent), self._tick)
 
     def capture(self):
         if self.shot is None or self.frozen:
@@ -536,7 +550,7 @@ class PhotoDialog(ctk.CTkToplevel):
         scale = max(self.winfo_fpixels("1i") / 96, 1.0)           # Windows display scaling
         screen_h = self.winfo_screenheight()
         room = screen_h - 120 - int(245 * scale)                   # minus taskbar/title bar and the controls
-        height = max(180, min(room, int(screen_h * 0.35), int(self.PREVIEW_W / aspect)))
+        height = max(480, min(room, int(screen_h * 0.35), int(self.PREVIEW_W / aspect)))
         return int(height * aspect)
 
 class StaleDaysDialog(ctk.CTkToplevel):
@@ -673,16 +687,17 @@ class ContextMenu(ctk.CTkToplevel):
             pass
         self.destroy()
 
-
 class CameraStream:
     """Keeps one camera open; a background thread always holds the newest frame."""
-    def __init__(self, index):
+    def __init__(self, index, width=1920, height=1080, fps=15):
         self.index = index
+        self.want = (width, height, fps)
         self.cap = _open_camera(index)
         self.ok = self.cap.isOpened()
         self._frame, self._lock, self._stop = None, threading.Lock(), threading.Event()
         self.count = 0
         self.last_used = time.monotonic()
+        self._t0 = time.monotonic()
         self._thread = None
         if not self.ok:
             return
@@ -694,15 +709,29 @@ class CameraStream:
             if not self.ok:
                 return
             self._configure(mjpg=False)
+        log.info("Camera opened: %s", self._describe())
+        self._t0 = time.monotonic()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def _configure(self, mjpg):
+        w, h, fps = self.want
         if mjpg:
             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # before size
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    def _describe(self):
+        try:
+            w, h = self.size()
+            code = int(self.cap.get(cv2.CAP_PROP_FOURCC) or 0) & 0xFFFFFFFF
+            raw = code.to_bytes(4, "little")
+            fcc = "".join(chr(b) if 32 <= b < 127 else "?" for b in raw).strip()
+            return f"{w}x{h} {fcc or '?'} (asked for {self.want})"
+        except Exception:
+            return f"(couldn't read camera details) (asked for {self.want})"
 
     def _loop(self):
         while not self._stop.is_set():
@@ -727,6 +756,9 @@ class CameraStream:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
+            secs = max(time.monotonic() - self._t0, 0.001)
+            log.info("Camera closed: %s, %.1f fps measured over %.0fs",
+                     self._describe(), self.count / secs, secs)
         self.cap.release()
         
 class CameraPicker(ctk.CTkToplevel):
@@ -858,6 +890,187 @@ class CameraPicker(ctk.CTkToplevel):
                 pass
         self._release()
         self.destroy()
+
+class CameraLab(ctk.CTkToplevel):
+    """On-site tester: opens the camera at chosen settings and shows live numbers,
+    so the right setting for a slow computer can be picked without a new build."""
+
+    SIZES = {"640 × 480": (640, 480), "1280 × 720": (1280, 720), "1920 × 1080": (1920, 1080)}
+    FPS = {"10 fps": 10, "15 fps": 15, "30 fps": 30}
+    PW, PH = 480, 270
+
+    def __init__(self, parent, camera_index, size, fps, on_apply):
+        super().__init__(parent)
+        self.withdraw()
+        self.configure(fg_color=COLORS["bg"])
+        self.title("Camera Test")
+        self.resizable(False, False)
+        self.index, self.on_apply = camera_index, on_apply
+        self.stream, self.closed = None, False
+        self._tick_job = self._restart_job = None
+        self._last_count = -1
+        self._reset_stats()
+
+        card = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=16,
+                            border_width=1, border_color=COLORS["border"])
+        card.pack(fill="both", expand=True, padx=12, pady=12)
+        ctk.CTkLabel(card, text="Camera test", font=font(18, "bold"),
+                     text_color=COLORS["text"]).pack(padx=20, pady=(16, 2))
+        ctk.CTkLabel(card, text="Try a setting, watch the numbers, keep the best one that stays smooth.",
+                     font=font(12), text_color=COLORS["text_muted"]).pack(padx=20, pady=(0, 10))
+
+        self._tkimg = ImageTk.PhotoImage(Image.new("RGB", (self.PW, self.PH), COLORS["bg"]))
+        tk.Label(card, image=self._tkimg, bg=COLORS["bg"], bd=0).pack(padx=20)
+
+        opts = ctk.CTkFrame(card, fg_color="transparent")
+        opts.pack(pady=(12, 0))
+        size_name = next((n for n, v in self.SIZES.items() if v == tuple(size)), "1920 × 1080")
+        fps_name = next((n for n, v in self.FPS.items() if v == fps), "15 fps")
+        self.size_var, self.fps_var = tk.StringVar(value=size_name), tk.StringVar(value=fps_name)
+        self.heavy_var = tk.BooleanVar(value=False)
+        om = dict(width=130, height=32, font=font(12), fg_color=COLORS["card_alt"],
+                  button_color=COLORS["border"], button_hover_color=COLORS["primary_dark"],
+                  text_color=COLORS["text"], command=lambda v: self._schedule_restart())
+        ctk.CTkOptionMenu(opts, values=list(self.SIZES), variable=self.size_var, **om).pack(side="left", padx=4)
+        ctk.CTkOptionMenu(opts, values=list(self.FPS), variable=self.fps_var, **om).pack(side="left", padx=4)
+        ctk.CTkSwitch(opts, text="Heavy preview", variable=self.heavy_var, font=font(12),
+                      text_color=COLORS["text_muted"], command=self._reset_stats
+                      ).pack(side="left", padx=(12, 0))
+
+        self.stats = ctk.CTkLabel(card, text="Opening camera...", font=font(13), justify="left",
+                                  text_color=COLORS["text"])
+        self.stats.pack(padx=20, pady=(12, 2), anchor="w")
+        self.verdict = ctk.CTkLabel(card, text="", font=font(14, "bold"),
+                                    text_color=COLORS["text_muted"])
+        self.verdict.pack(padx=20, pady=(0, 8), anchor="w")
+
+        bar = ctk.CTkFrame(card, fg_color="transparent")
+        bar.pack(pady=(4, 16))
+        ctk.CTkButton(bar, text="Use these settings", width=160, height=38, corner_radius=10,
+                      font=font(13, "bold"), fg_color=COLORS["primary"],
+                      hover_color=COLORS["primary_dark"], text_color=COLORS["on_primary"],
+                      command=self._apply).pack(side="left", padx=5)
+        ctk.CTkButton(bar, text="Close", width=90, height=38, corner_radius=10, font=font(13),
+                      fg_color=COLORS["card_alt"], hover_color=COLORS["border"],
+                      text_color=COLORS["text"], command=self.close).pack(side="left", padx=5)
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        center_over(self, parent)
+        self.transient(parent)
+        self.deiconify()
+        self._restart_job = self.after(150, self._restart)
+        self._tick()
+
+    def _settings(self):
+        w, h = self.SIZES[self.size_var.get()]
+        return w, h, self.FPS[self.fps_var.get()]
+
+    def _reset_stats(self):
+        self._w_start = time.monotonic()
+        self._w_cpu = time.process_time()
+        self._w_cam = self.stream.count if self.stream else 0
+        self._w_draws, self._w_ms, self._w_worst = 0, 0.0, 0.0
+
+    def _schedule_restart(self):
+        self.stats.configure(text="Opening camera...")
+        self.verdict.configure(text="")
+        if self._restart_job:
+            self.after_cancel(self._restart_job)
+        self._restart_job = self.after(50, self._restart)
+
+    def _restart(self):
+        self._restart_job = None
+        if self.closed:
+            return
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        w, h, fps = self._settings()
+        self.stream = CameraStream(self.index, w, h, fps)
+        self._last_count = -1
+        if not self.stream.ok:
+            self.stats.configure(text="Camera not found")
+            return
+        self._reset_stats()
+
+    def _tick(self):
+        if self.closed:
+            return
+        t0 = time.monotonic()
+        s, fps = self.stream, self._settings()[2]
+        if s and s.ok and s.count != self._last_count:
+            frame = s.latest()
+            if frame is not None:
+                self._last_count = s.count
+                paint_preview(frame, self._tkimg, self.PW, self.PH, fast=not self.heavy_var.get())
+                cost = (time.monotonic() - t0) * 1000
+                self._w_draws += 1
+                self._w_ms += cost
+                self._w_worst = max(self._w_worst, cost)
+
+        dt = time.monotonic() - self._w_start
+        if s and s.ok and dt >= 1.0:
+            cam_fps = (s.count - self._w_cam) / dt
+            draws = self._w_draws / dt
+            avg = self._w_ms / self._w_draws if self._w_draws else 0.0
+            cpu = (time.process_time() - self._w_cpu) / dt * 100
+            self.stats.configure(text=(
+                f"Camera delivers    {cam_fps:4.1f} fps\n"
+                f"Preview draws     {draws:4.1f} fps   (avg {avg:.0f} ms, worst {self._w_worst:.0f} ms)\n"
+                f"App CPU use        {cpu:3.0f}% of one core"))
+            smooth = (cam_fps >= 0.8 * fps and draws >= 0.8 * fps and avg < 0.6 * (1000 / fps))
+            self.verdict.configure(
+                text="✔ Smooth" if smooth else "✖ Choppy - try a lower setting",
+                text_color=COLORS["success"] if smooth else COLORS["warning"])
+            self._reset_stats()
+        spent = int((time.monotonic() - t0) * 1000)
+        self._tick_job = self.after(max(15, int(500 / fps) - spent), self._tick)
+
+    def _apply(self):
+        w, h, fps = self._settings()
+        self.close()
+        self.on_apply(w, h, fps)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        for job in (self._tick_job, self._restart_job):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        self.destroy()
+
+class Toast(ctk.CTkToplevel):
+    """Small non-blocking popup in the bottom-right of the main window; closes itself."""
+
+    def __init__(self, parent, text, ms=2200):
+        super().__init__(parent)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.configure(fg_color=COLORS["success"])
+        ctk.CTkLabel(self, text=text, font=font(13, "bold"), text_color="#052e16"
+                     ).pack(padx=18, pady=10)
+        self.update_idletasks()
+        top = parent.winfo_toplevel()
+        x = top.winfo_rootx() + top.winfo_width() - self.winfo_reqwidth() - 24
+        y = top.winfo_rooty() + top.winfo_height() - self.winfo_reqheight() - 40
+        self.geometry(f"+{x}+{y}")
+        self.deiconify()
+        self.after(ms, self._close)
+
+    def _close(self):
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 class UploadWorker(threading.Thread):
     """Uploads in the background so a slow connection never blocks the next scan."""
@@ -1112,7 +1325,7 @@ class PhotoBrowser(ctk.CTkFrame):
         self.tree = ttk.Treeview(box, columns=("last",), show="tree headings",
                                  selectmode="browse", height=6)
         self.tree.heading("#0", text="Days · Subjects  /  Student", anchor="w")
-        self.tree.column("#0", width=300, stretch=True)
+        self.tree.column("#0", width=350, stretch=True)
         self.tree.heading("last", text="Last photo", anchor="e")
         scale = max(self.winfo_fpixels("1i") / 96, 1.0)
         self.tree.column("last", width=int(150 * scale), anchor="e", stretch=False)

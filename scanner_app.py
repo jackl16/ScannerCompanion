@@ -830,6 +830,8 @@ class ScannerApp(ctk.CTk):
                 elif kind == "photo_uploaded":
                     if self._widget_alive("photo_browser"):
                         self.photo_browser.on_uploaded(port, payload)
+                    from photo_capture import Toast
+                    Toast(self, f"Uploaded ✓  {payload}")
                 elif kind == "test_result":
                     self._testing = False
                     if self._widget_alive("status_label"):
@@ -926,6 +928,7 @@ class ScannerApp(ctk.CTk):
             command=self._on_photo_mode_toggled,
         )
         self.settings_menu.add_command(label="Choose Camera...", command=self._choose_camera)
+        self.settings_menu.add_command(label="Camera Test...", command=self._open_camera_lab)
         self.settings_menu.add_command(label="Photo Alert Days...", command=self._configure_stale_days)
         self.settings_menu.add_command(label="Disconnect Google Drive...", command=self._disconnect_google)
         self._photo_toggle_added = True
@@ -1278,6 +1281,20 @@ class ScannerApp(ctk.CTk):
             self._log(f"Camera set to Camera {index + 1}")
 
         CameraPicker(self, self.db.camera_index, picked)
+
+    def _open_camera_lab(self):
+        if self._photo_busy:
+            messagebox.showinfo("Camera Test", "Finish the current photo first.")
+            return
+        self._release_camera()
+        from photo_capture import CameraLab
+
+        def apply(w, h, fps):
+            self.db.save_camera_settings(w, h, fps)
+            self._log(f"Camera set to {w}×{h} at {fps} fps")
+
+        CameraLab(self, self.db.camera_index,
+                  (self.db.camera_width, self.db.camera_height), self.db.camera_fps, apply)
 
     def _configure_stale_days(self):
         from photo_capture import StaleDaysDialog
@@ -1728,9 +1745,10 @@ class ScannerApp(ctk.CTk):
     def _get_camera(self):
         from photo_capture import CameraStream
         s = self.camera_stream
-        if s is None or not s.ok or s.index != self.db.camera_index:   # ok check: retry a dead camera
+        want = (self.db.camera_width, self.db.camera_height, self.db.camera_fps)
+        if s is None or not s.ok or s.index != self.db.camera_index or s.want != want:
             self._release_camera()
-            s = self.camera_stream = CameraStream(self.db.camera_index)
+            s = self.camera_stream = CameraStream(self.db.camera_index, *want)
         return s
 
     def _release_camera(self):
