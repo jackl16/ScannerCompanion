@@ -306,6 +306,67 @@ class DriveStore:
                     fileId=student_folder, body={"appProperties": {LAST_KEY: None}}
                 ).execute()
         return newest
+        
+    def merge_subject_folders(self, progress=None, cancel=None):
+        """One-time tidy-up: moves every photo out of the per-subject folders into the student's main
+        folder (adding the old folder name to the end of the file name, after the date) and trashes the
+        emptied folders. Safe to stop and re-run. Returns a dict of counts."""
+        FM = FOLDER_MIME
+
+        def call(req):
+            with self._lock:           # one Drive call at a time, so uploads and browsing can interleave
+                return req.execute(num_retries=3)
+
+        def list_all(q, fields):
+            token = None
+            while True:
+                resp = call(self.svc.files().list(q=q, pageSize=1000, pageToken=token,
+                                                  fields=f"nextPageToken, files({fields})"))
+                yield from resp.get("files", [])
+                token = resp.get("nextPageToken")
+                if not token:
+                    return
+
+        stats = dict(students=0, moved=0, folders_removed=0, folders_kept=0, failed=0)
+        students = [f for f in list_all(f"'{self.root_id}' in parents and mimeType='{FM}' and trashed=false",
+                                        "id,name,appProperties")
+                    if re.fullmatch(r"student:[^:]+", (f.get("appProperties") or {}).get("kt_key", ""))]
+        for n, st in enumerate(students, 1):
+            if cancel is not None and cancel.is_set():
+                break
+            subs = list(list_all(f"'{st['id']}' in parents and mimeType='{FM}' and trashed=false", "id,name"))
+            if not subs:
+                continue
+            stats["students"] += 1
+            for sub in subs:
+                tag = re.sub(r"[^A-Za-z0-9]+", "-", sub["name"]).strip("-")
+                photos = list(list_all(f"'{sub['id']}' in parents and mimeType!='{FM}' and trashed=false", "id,name"))
+                for f in photos:
+                    stem, ext = os.path.splitext(f["name"])
+                    body = None
+                    if tag and not stem.endswith("_" + tag):
+                        body = {"name": f"{stem}_{tag}{ext}", "appProperties": {"label": tag}}
+                    try:
+                        call(self.svc.files().update(fileId=f["id"], body=body, addParents=st["id"],
+                                                     removeParents=sub["id"], fields="id"))
+                        stats["moved"] += 1
+                    except Exception as e:
+                        stats["failed"] += 1
+                        log.warning("Couldn't move %s: %s", f["name"], e)
+                if list(list_all(f"'{sub['id']}' in parents and trashed=false", "id")):
+                    stats["folders_kept"] += 1           # something other than a photo is still inside
+                    continue
+                try:
+                    call(self.svc.files().update(fileId=sub["id"], body={"trashed": True}, fields="id"))
+                    stats["folders_removed"] += 1
+                except Exception as e:
+                    stats["failed"] += 1
+                    log.warning("Couldn't remove folder %s: %s", sub["name"], e)
+            if progress:
+                progress(f"Tidying photo folders: student {n} of {len(students)}...")
+        self._cache.clear()
+        return stats
+
 
 def paint_preview(frame, tkimg, w, h, fast=True):
     """Draws a camera frame into an existing PhotoImage. fast=False is the old, heavier way (for comparing)."""
@@ -1342,13 +1403,20 @@ class PhotoBrowser(ctk.CTkFrame):
 
         self._render_job = None
 
-        self.columnconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
+        # draggable divider between the student list and the preview
+        self.panes = tk.PanedWindow(self, orient="horizontal", sashwidth=10, sashrelief="flat",
+                                    sashcursor="sb_h_double_arrow", bg=COLORS["bg"], bd=0,
+                                    opaqueresize=True)
+        self.panes.grid(row=0, column=0, sticky="nsew")
+
         # left card: folder tree
-        left = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=12,
+        left = ctk.CTkFrame(self.panes, fg_color=COLORS["card"], corner_radius=12,
                             border_width=1, border_color=COLORS["border"])
-        left.grid(row=0, column=0, sticky="ns", padx=(0, 10))
+        self.panes.add(left, minsize=int(340 * self._pill_scale),
+                       width=int(450 * self._pill_scale), stretch="never")
         bar = ctk.CTkFrame(left, fg_color="transparent")
         bar.pack(fill="x", padx=12, pady=(12, 0))
         ctk.CTkLabel(bar, text="STUDENT PHOTOS", font=font(11, "bold"),
@@ -1410,7 +1478,7 @@ class PhotoBrowser(ctk.CTkFrame):
         self.tree.column("#0", width=350, stretch=True)
         self.tree.heading("last", text="Last photo", anchor="e")
         scale = max(self.winfo_fpixels("1i") / 96, 1.0)
-        self.tree.column("last", width=int(150 * scale), anchor="e", stretch=False)
+        self.tree.column("last", width=int(130 * scale), anchor="e", stretch=False)
         self.tree.tag_configure("warn", foreground=COLORS["warning"])
         self.tree.tag_configure("stale", foreground=COLORS["error"])
         sb = ctk.CTkScrollbar(box, command=self.tree.yview, width=12, fg_color=COLORS["card"],
@@ -1420,9 +1488,9 @@ class PhotoBrowser(ctk.CTkFrame):
         sb.pack(side="right", fill="y", padx=(2, 4))
 
         # right card: preview
-        right = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=12,
+        right = ctk.CTkFrame(self.panes, fg_color=COLORS["card"], corner_radius=12,
                              border_width=1, border_color=COLORS["border"])
-        right.grid(row=0, column=1, sticky="nsew")
+        self.panes.add(right, minsize=int(320 * self._pill_scale), stretch="always")
         self.caption = ctk.CTkLabel(right, text="", font=font(13, "bold"), anchor="w",
                                     text_color=COLORS["text"])
         self.caption.pack(fill="x", padx=16, pady=(14, 0))

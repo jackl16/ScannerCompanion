@@ -337,6 +337,7 @@ class ScannerApp(ctk.CTk):
         self.photo_worker = None
         self.camera_stream = None
         self._drive_connecting = False
+        self._merging = False
 
         self.scan_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -844,6 +845,24 @@ class ScannerApp(ctk.CTk):
                     if self._widget_alive("status_label"):
                         self.status_label.config(text="Waiting for scan...", fg=COLORS["text_muted"])
                     self.after(50, lambda t=payload: messagebox.showinfo("Connection test", t))
+                elif kind == "merge_progress":
+                    if self._widget_alive("status_label"):
+                        self.status_label.config(text=payload, fg=COLORS["text_muted"])
+                elif kind == "merge_done":
+                    self._merging = False
+                    msg = (f"Moved {payload['moved']} photo(s) for {payload['students']} student(s) and "
+                           f"removed {payload['folders_removed']} empty folder(s).")
+                    if payload["folders_kept"]:
+                        msg += f"\n{payload['folders_kept']} folder(s) were kept because they hold something other than photos."
+                    if payload["failed"]:
+                        msg += f"\n{payload['failed']} problem(s): run it again and it will pick up where it stopped."
+                    self._log("🗂 " + msg.replace("\n", " "))
+                    self.after(50, lambda m=msg: messagebox.showinfo("Tidy Photo Folders", m))
+                    if self._widget_alive("photo_browser"):
+                        self.photo_browser.refresh()
+                elif kind == "merge_failed":
+                    self._merging = False
+                    self.after(50, lambda m=payload: messagebox.showerror("Tidy Photo Folders", f"Stopped:\n{m}"))
         except queue.Empty:
             pass
         finally:
@@ -937,6 +956,7 @@ class ScannerApp(ctk.CTk):
         self.settings_menu.add_command(label="Choose Camera...", command=self._choose_camera)
         self.settings_menu.add_command(label="Camera Test...", command=self._open_camera_lab)
         self.settings_menu.add_command(label="Photo Alert Days...", command=self._configure_stale_days)
+        self.settings_menu.add_command(label="Tidy Photo Folders...", command=self._tidy_photo_folders)
         self.settings_menu.add_command(label="Disconnect Google Drive...", command=self._disconnect_google)
         self._photo_toggle_added = True
 
@@ -1361,6 +1381,38 @@ class ScannerApp(ctk.CTk):
             self._log(f"Photo alerts set: amber after {warn} days, red after {bad} days")
 
         StaleDaysDialog(self, self.db.stale_warn_days, self.db.stale_bad_days, saved)
+
+    def _tidy_photo_folders(self):
+        if self._merging:
+            messagebox.showinfo("Tidy Photo Folders", "Already running.")
+            return
+        if self._photo_busy:
+            messagebox.showinfo("Tidy Photo Folders", "Finish the current photo first.")
+            return
+        if not self._ensure_photo_backend():
+            return
+        if not messagebox.askyesno(
+            "Tidy Photo Folders",
+            "This moves every student's photos out of their Math / Reading folders and into the "
+            "student's main folder, then removes the empty folders (they go to the Drive trash).\n\n"
+            "File names keep their date and gain the old folder name at the end.\n"
+            "It can take several minutes. You can keep using the app, and it is safe to close and "
+            "run again.\n\nStart?"):
+            return
+        self._merging = True
+        self._log("🗂 Tidying photo folders...")
+        store = self.photo_worker.store
+
+        def work():
+            try:
+                stats = store.merge_subject_folders(
+                    progress=lambda t: self.scan_queue.put(("merge_progress", "", t)))
+                self.scan_queue.put(("merge_done", "", stats))
+            except Exception as e:
+                log.exception("Tidy photo folders failed")
+                self.scan_queue.put(("merge_failed", "", str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _disconnect_google(self):
         if self._photo_busy:
