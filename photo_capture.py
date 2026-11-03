@@ -23,6 +23,7 @@ import sys
 import tempfile
 import webbrowser
 from collections import OrderedDict
+import re
 
 from datetime import datetime
 from tkinter import ttk
@@ -225,21 +226,24 @@ class DriveStore:
             return self._upload(*args, **kwargs)
 
     def _upload(self, student_id, last, first, subject, jpeg, barcode=None, taken_at=None):
-        """Saves to <root>/<First, Last (ID)>/<subject>/ and keeps only the newest N photos per subject."""
+        """Saves straight into <root>/<First, Last (ID)>/ and keeps only the newest N photos per student.
+        `subject` (for example "Math - Planning") goes on the end of the file name as a label."""
         try:
             label = student_id
             student = self._find_or_create(f"student:{student_id}", f"{first}, {last} ({label})", self.root_id)
-            folder = self._find_or_create(f"student:{student_id}:{subject}", subject, student)
             stamp = datetime.fromtimestamp(taken_at) if taken_at else datetime.now()
-            name = stamp.strftime("%Y-%m-%d_%H-%M-%S") + ".jpg"
+            tag = re.sub(r"[^A-Za-z0-9]+", "-", str(subject)).strip("-")
+            name = stamp.strftime("%Y-%m-%d_%H-%M-%S") + (f"_{tag}" if tag else "") + ".jpg"
             media = MediaIoBaseUpload(io.BytesIO(jpeg), mimetype="image/jpeg")
-            self.svc.files().create(body={"name": name, "parents": [folder]}, media_body=media, fields="id").execute()
+            self.svc.files().create(body={"name": name, "parents": [student], "appProperties": {"label": tag}},
+                                    media_body=media, fields="id").execute()
             try:
                 self._set_last_photo(student, stamp)
             except Exception as e:   # never let this trigger a re-upload of the photo
                 log.warning("Couldn't stamp last-photo date: %s", e)
-            files = self.svc.files().list(q=f"'{folder}' in parents and trashed=false",
-                                          orderBy="createdTime desc", fields="files(id)").execute()["files"]
+            files = self.svc.files().list(
+                q=f"'{student}' in parents and trashed=false and mimeType!='{FOLDER_MIME}'",
+                orderBy="createdTime desc", fields="files(id)").execute()["files"]
             for old in files[self.keep:]:
                 self.svc.files().delete(fileId=old["id"]).execute()
         except Exception:
@@ -254,7 +258,7 @@ class DriveStore:
         with self._lock:
             resp = self.svc.files().list(
                 q=q, pageSize=1000,
-                orderBy="createdTime desc" if newest_first else "name_natural",
+                orderBy="name desc" if newest_first else "name_natural",
                 fields="files(id,name,mimeType,createdTime,appProperties)",
             ).execute(num_retries=3)
         return resp.get("files", [])
@@ -278,26 +282,20 @@ class DriveStore:
             self.svc.files().delete(fileId=file_id).execute()
 
     def backfill_last_photo(self, student_folder, clear_if_empty=False):
-        """One-time: finds the newest photo across a student's subject folders (by file name,
-        which is the timestamp), saves it on the folder, and returns it. None if no photos."""
+        """Finds the newest photo in a student's folder (file names start with the date), saves that
+        date on the folder, and returns it. None if there are no photos."""
         newest = None
         with self._lock:
-            subs = self.svc.files().list(
-                q=f"'{student_folder}' in parents and trashed=false and mimeType='{FOLDER_MIME}'",
-                fields="files(id)", pageSize=100).execute(num_retries=3).get("files", [])
-            for sub in subs:
-                hit = self.svc.files().list(
-                    q=f"'{sub['id']}' in parents and trashed=false and mimeType!='{FOLDER_MIME}'",
-                    orderBy="name desc", pageSize=1,
-                    fields="files(name)").execute(num_retries=3).get("files", [])
-                if not hit:
-                    continue
+            hits = self.svc.files().list(
+                q=f"'{student_folder}' in parents and trashed=false and mimeType!='{FOLDER_MIME}'",
+                orderBy="name desc", pageSize=10,
+                fields="files(name)").execute(num_retries=3).get("files", [])
+            for h in hits:
                 try:
-                    t = datetime.strptime(hit[0]["name"].rsplit(".", 1)[0], "%Y-%m-%d_%H-%M-%S")
+                    newest = datetime.strptime(h["name"][:19], "%Y-%m-%d_%H-%M-%S")
+                    break
                 except ValueError:
                     continue
-                if newest is None or t > newest:
-                    newest = t
             if newest:
                 self.svc.files().update(
                     fileId=student_folder,
@@ -1548,7 +1546,7 @@ class PhotoBrowser(ctk.CTkFrame):
     def _on_open(self, event):
         iid = self.tree.focus()
         meta = self.meta.get(iid)
-        if not meta or meta["kind"] not in ("student", "subject") or iid in self._loading:
+        if not meta or meta["kind"] != "student" or iid in self._loading:
             return
         store = self.get_store()
         if store is None:
@@ -1558,11 +1556,7 @@ class PhotoBrowser(ctk.CTkFrame):
         self._run(self._fetch_children, store, iid, meta)
 
     def _fetch_children(self, store, iid, meta):
-        if meta["kind"] == "student":
-            items = store.list_children(meta["id"], folders_only=True)
-        else:
-            items = store.list_children(meta["id"], newest_first=True)
-        return ("children", iid, items)
+        return ("children", iid, store.list_children(meta["id"], newest_first=True))
 
     def _on_select(self, event):
         sel = self.tree.selection()
@@ -1570,10 +1564,8 @@ class PhotoBrowser(ctk.CTkFrame):
         if not (meta and meta["kind"] == "photo"):
             return
         self._leave_compare_state()
-        subject_iid = self.tree.parent(sel[0])
-        student_iid = self.tree.parent(subject_iid)
+        student_iid = self.tree.parent(sel[0])
         self.caption.configure(text=f"{self.tree.item(student_iid, 'text')}   •   "
-                                    f"{self.tree.item(subject_iid, 'text')}   •   "
                                     f"{self.tree.item(sel[0], 'text')}")
         self._selected = meta["id"]
         self.open_btn.configure(state="normal")
@@ -1647,16 +1639,14 @@ class PhotoBrowser(ctk.CTkFrame):
             if not self.tree.exists(iid):
                 return
             self.tree.delete(*self.tree.get_children(iid))
-            parent_kind = self.meta[iid]["kind"]
+            shown = 0
             for it in items:
-                if parent_kind == "student":
-                    child = self.tree.insert(iid, "end", text=it["name"])
-                    self.meta[child] = {"kind": "subject", "id": it["id"]}
-                    self.tree.insert(child, "end", text="Loading...")
-                else:
-                    child = self.tree.insert(iid, "end", text=self._pretty_time(it["name"]))
-                    self.meta[child] = {"kind": "photo", "id": it["id"]}
-            if not items:
+                if it.get("mimeType") == FOLDER_MIME:
+                    continue                                   # leftover subject folder: ignore it
+                child = self.tree.insert(iid, "end", text=self._pretty_time(it["name"]))
+                self.meta[child] = {"kind": "photo", "id": it["id"], "label": self._label_of(it["name"])}
+                shown += 1
+            if not shown:
                 self.tree.insert(iid, "end", text="(nothing here yet)")
             self.status.config(text="")
         elif kind == "image":
@@ -1711,7 +1701,7 @@ class PhotoBrowser(ctk.CTkFrame):
         return str(self.tree.item(iid, "open")).lower() in ("1", "true")
 
     def on_uploaded(self, student_id, subject):
-        """A photo finished uploading: refresh only the folder the user could be looking at."""
+        """A photo finished uploading: refresh the student's list if it's open."""
         sid = str(student_id)
         self._last[sid] = datetime.now()
         self._checking.discard(sid)
@@ -1722,20 +1712,13 @@ class PhotoBrowser(ctk.CTkFrame):
             if self.tree.get_children():  # list is loaded and this student's folder is brand new
                 self.refresh()
             return
-        if not self._is_open(student_iid):
+        if not self._is_open(student_iid) or student_iid in self._loading:
             return  # collapsed: it loads fresh next time it's opened
         store = self.get_store()
         if store is None:
             return
-        subject_iid = next((c for c in self.tree.get_children(student_iid)
-                            if self.tree.item(c, "text") == subject and c in self.meta), None)
-        if subject_iid is not None:
-            if self._is_open(subject_iid) and subject_iid not in self._loading:
-                self._loading.add(subject_iid)
-                self._run(self._fetch_children, store, subject_iid, self.meta[subject_iid])
-        elif student_iid not in self._loading:
-            self._loading.add(student_iid)  # first photo for this subject: its folder is new
-            self._run(self._fetch_children, store, student_iid, self.meta[student_iid])
+        self._loading.add(student_iid)
+        self._run(self._fetch_children, store, student_iid, self.meta[student_iid])
 
     def _delete_selected_photo(self):
         sel = self.tree.selection()
@@ -1755,7 +1738,7 @@ class PhotoBrowser(ctk.CTkFrame):
             return
 
         iid, file_id = sel[0], meta["id"]
-        student_iid = self.tree.parent(self.tree.parent(iid))     # photo -> folder -> student
+        student_iid = self.tree.parent(iid)     # photo -> student
         smeta = self.meta.get(student_iid) or {}
         sid, student_folder = smeta.get("student_id"), smeta.get("id")
 
@@ -1779,12 +1762,19 @@ class PhotoBrowser(ctk.CTkFrame):
         self.status.config(text=self._count_text())
 
     @staticmethod
+    def _label_of(name):
+        """'2026-10-29_14-03-11_Math-Planning.jpg' -> 'Math Planning' ('' when the name has no label)."""
+        return name.rsplit(".", 1)[0][20:].replace("-", " ").strip()
+
+    @staticmethod
     def _pretty_time(name):
         try:
-            stamp = datetime.strptime(name.rsplit(".", 1)[0], "%Y-%m-%d_%H-%M-%S")
-            return stamp.strftime("%b %d, %Y  %I:%M %p")
+            stamp = datetime.strptime(name[:19], "%Y-%m-%d_%H-%M-%S")
         except ValueError:
             return name
+        text = stamp.strftime("%b %d, %Y  %I:%M %p")
+        label = PhotoBrowser._label_of(name)
+        return f"{text}   ·  {label}" if label else text
 
     # --- zoom / pan viewer ---
 
@@ -2056,13 +2046,15 @@ class PhotoBrowser(ctk.CTkFrame):
         self._q.put(("backfill_done",))
     # Compare photos
     def _previous_photo(self):
+        """The next-older photo of the same kind (same label) as the selected one."""
         sel = self.tree.selection()
-        if not sel or (self.meta.get(sel[0]) or {}).get("kind") != "photo":
+        cur = self.meta.get(sel[0]) if sel else None
+        if not cur or cur.get("kind") != "photo":
             return None
         sibs = self.tree.get_children(self.tree.parent(sel[0]))
         for iid in sibs[sibs.index(sel[0]) + 1:]:
             m = self.meta.get(iid)
-            if m and m["kind"] == "photo":
+            if m and m["kind"] == "photo" and m.get("label", "") == cur.get("label", ""):
                 return {**m, "iid": iid}
         return None
 
