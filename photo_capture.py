@@ -30,7 +30,7 @@ from ui_kit import messagebox
 
 from scanner_db import BASE_DIR as BASE, DAY_NAMES
 import customtkinter as ctk
-from ui_kit import COLORS, FONT, font, StatusText, center_over
+from ui_kit import COLORS, FONT, MONO, font, StatusText, center_over
 
 import cv2
 from PIL import Image, ImageTk, ImageDraw, ImageFont
@@ -344,12 +344,12 @@ class PhotoDialog(ctk.CTkToplevel):
         self.zoom, self._start_zoom, self.on_zoom = zoom, zoom, on_zoom
         self._tick_job = self._act_job = None
         self.stream = stream
-        self._last_count = -1
-        self._tick_ms = max(15, int(500 / stream.want[2]))    # check twice per camera frame
         self.multi = multi
+        self._last_count = -1
+        self._sized = False
+        self._tick_ms = max(15, int(500 / stream.want[2]))    # check twice per camera frame
 
-        if not stream.ok:
-            messagebox.showerror("Camera", "Camera not found", parent=parent)
+        if not stream.ok:                    # the app shows the "camera not found" message once
             self.finish(None)
             return
 
@@ -384,7 +384,7 @@ class PhotoDialog(ctk.CTkToplevel):
         cam_w, cam_h = stream.size()
         self.preview_w = self._fit_preview_width(cam_w / cam_h)
         self._pv_h = int(self.preview_w * cam_h / cam_w)
-        self._tkimg = ImageTk.PhotoImage(Image.new("RGB", (self.preview_w, self._pv_h), COLORS["bg"]))
+        self._tkimg = self._placeholder("Starting camera...")
         self.view = tk.Label(self.box, image=self._tkimg, bg=COLORS["bg"], bd=0)
         self.view.pack(padx=6, pady=6)
 
@@ -493,14 +493,41 @@ class PhotoDialog(ctk.CTkToplevel):
         self.zoom_slider.set(self.zoom)
         self.zoom_label.configure(text=f"{self.zoom:.1f}×")
 
+    def _placeholder(self, text):
+        img = Image.new("RGB", (self.preview_w, self._pv_h), COLORS["bg"])
+        ImageDraw.Draw(img).text((self.preview_w // 2, self._pv_h // 2), text,
+                                 font=_pill_font(20), fill=COLORS["text_muted"], anchor="mm")
+        return ImageTk.PhotoImage(img)
+
+    def _fit_to_frame(self, frame):
+        """If the camera gave a different shape than we asked for, reshape the preview to match."""
+        h, w = frame.shape[:2]
+        if abs(w / h - self.preview_w / self._pv_h) < 0.02:
+            return
+        self.preview_w = self._fit_preview_width(w / h)
+        self._pv_h = int(self.preview_w * h / w)
+        self._tkimg = ImageTk.PhotoImage(Image.new("RGB", (self.preview_w, self._pv_h), COLORS["bg"]))
+        self.view.configure(image=self._tkimg)
+        try:
+            self.update_idletasks()
+            center_over(self, self.master)
+        except Exception:
+            pass
+
     def _tick(self):
         if self.closed:
             return
         t0 = time.monotonic()
+        if self.stream.state == "failed":
+            self.finish(None)
+            return
         if not self.frozen and self.stream.count != self._last_count:
             frame = self.stream.latest()
             if frame is not None:
                 self._last_count = self.stream.count
+                if not self._sized:
+                    self._sized = True
+                    self._fit_to_frame(frame)
                 frame = self._crop(frame)
                 self.shot = frame                         # full-res, this is what gets saved
                 paint_preview(frame, self._tkimg, self.preview_w, self._pv_h)
@@ -688,31 +715,34 @@ class ContextMenu(ctk.CTkToplevel):
         self.destroy()
 
 class CameraStream:
-    """Keeps one camera open; a background thread always holds the newest frame."""
+    """Keeps one camera open on a background thread, which always holds the newest frame.
+    Opening happens on that thread too, so creating a stream never freezes the window.
+    state: "opening" -> "ready" (or "failed")."""
+
+    _open_lock = threading.Lock()          # camera opens happen one at a time
+
     def __init__(self, index, width=1920, height=1080, fps=15):
         self.index = index
         self.want = (width, height, fps)
-        self.cap = _open_camera(index)
-        self.ok = self.cap.isOpened()
+        self.state = "opening"
+        self.cap = None
+        self._size = (width, height)
+        self._info = ""
         self._frame, self._lock, self._stop = None, threading.Lock(), threading.Event()
         self.count = 0
         self.last_used = time.monotonic()
         self._t0 = time.monotonic()
-        self._thread = None
-        if not self.ok:
-            return
-        self._configure(mjpg=True)
-        if not self.cap.read()[0]:           # camera didn't like MJPG: reopen and use its default
-            self.cap.release()
-            self.cap = _open_camera(index)
-            self.ok = self.cap.isOpened()
-            if not self.ok:
-                return
-            self._configure(mjpg=False)
-        log.info("Camera opened: %s", self._describe())
-        self._t0 = time.monotonic()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    @property
+    def ok(self):
+        """Still opening counts as fine; only a failed open is not."""
+        return self.state != "failed"
+
+    @property
+    def ready(self):
+        return self.state == "ready"
 
     def _configure(self, mjpg):
         w, h, fps = self.want
@@ -723,9 +753,25 @@ class CameraStream:
         self.cap.set(cv2.CAP_PROP_FPS, fps)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+    def _open_configured(self, mjpg):
+        self.cap = _open_camera(self.index)
+        if not self.cap.isOpened():
+            return False
+        self._configure(mjpg)
+        for _ in range(3):                 # the first frames can be slow to arrive
+            ok, frame = self.cap.read()
+            if ok:
+                with self._lock:
+                    self._frame = frame
+                self.count += 1
+                return True
+            time.sleep(0.1)
+        return False
+
     def _describe(self):
         try:
-            w, h = self.size()
+            w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
             code = int(self.cap.get(cv2.CAP_PROP_FOURCC) or 0) & 0xFFFFFFFF
             raw = code.to_bytes(4, "little")
             fcc = "".join(chr(b) if 32 <= b < 127 else "?" for b in raw).strip()
@@ -733,7 +779,43 @@ class CameraStream:
         except Exception:
             return f"(couldn't read camera details) (asked for {self.want})"
 
-    def _loop(self):
+    def _release(self):
+        try:
+            if self.cap is not None:
+                self.cap.release()
+        except Exception:
+            pass
+        self.cap = None
+
+    def _run(self):
+        try:
+            with CameraStream._open_lock:
+                try:
+                    ok = False if self._stop.is_set() else self._open_configured(mjpg=True)
+                    if not ok and not self._stop.is_set():
+                        self._release()            # camera didn't like MJPG: reopen with its default
+                        ok = self._open_configured(mjpg=False)
+                    if self._stop.is_set():
+                        raise RuntimeError("closed while opening")
+                    if not ok:
+                        raise RuntimeError("camera did not deliver frames")
+                    w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                    h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                    if w and h:
+                        self._size = (w, h)
+                    self._info = self._describe()
+                except Exception:
+                    self._release()
+                    raise
+            log.info("Camera opened: %s", self._info)
+        except Exception as e:
+            if not self._stop.is_set():
+                log.warning("Camera open failed: %s", e)
+            self.state = "failed"
+            return
+
+        self._t0 = time.monotonic()
+        self.state = "ready"
         while not self._stop.is_set():
             ok, frame = self.cap.read()
             if ok:
@@ -742,6 +824,9 @@ class CameraStream:
                 self.count += 1
             else:
                 time.sleep(0.05)
+        secs = max(time.monotonic() - self._t0, 0.001)
+        log.info("Camera closed: %s, %.1f fps measured over %.0fs", self._info, self.count / secs, secs)
+        self._release()                    # released by the thread that owns it
 
     def latest(self):
         self.last_used = time.monotonic()
@@ -749,17 +834,12 @@ class CameraStream:
             return self._frame
 
     def size(self):
-        return (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640),
-                int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480))
+        return self._size
 
     def close(self):
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=2)
-            secs = max(time.monotonic() - self._t0, 0.001)
-            log.info("Camera closed: %s, %.1f fps measured over %.0fs",
-                     self._describe(), self.count / secs, secs)
-        self.cap.release()
+        if self.state == "ready":
+            self._thread.join(timeout=1.5)     # let the reader finish so the camera is really released
         
 class CameraPicker(ctk.CTkToplevel):
     """Cycles through connected cameras with a live preview; the user picks the one to use."""
@@ -908,7 +988,7 @@ class CameraLab(ctk.CTkToplevel):
         self.index, self.on_apply = camera_index, on_apply
         self.stream, self.closed = None, False
         self._tick_job = self._restart_job = None
-        self._last_count = -1
+        self._last_count, self._ready_seen = -1, False
         self._reset_stats()
 
         card = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=16,
@@ -916,7 +996,7 @@ class CameraLab(ctk.CTkToplevel):
         card.pack(fill="both", expand=True, padx=12, pady=12)
         ctk.CTkLabel(card, text="Camera test", font=font(18, "bold"),
                      text_color=COLORS["text"]).pack(padx=20, pady=(16, 2))
-        ctk.CTkLabel(card, text="Try a setting, watch the numbers, keep the best one that stays smooth.",
+        ctk.CTkLabel(card, text="Try a setting and keep the best one that stays smooth.",
                      font=font(12), text_color=COLORS["text_muted"]).pack(padx=20, pady=(0, 10))
 
         self._tkimg = ImageTk.PhotoImage(Image.new("RGB", (self.PW, self.PH), COLORS["bg"]))
@@ -937,12 +1017,14 @@ class CameraLab(ctk.CTkToplevel):
                       text_color=COLORS["text_muted"], command=self._reset_stats
                       ).pack(side="left", padx=(12, 0))
 
-        self.stats = ctk.CTkLabel(card, text="Opening camera...", font=font(13), justify="left",
+        # fixed-size text areas: the numbers change every second but the layout never does
+        self.stats = ctk.CTkLabel(card, text="Opening camera...", width=480, height=66, anchor="w",
+                                  justify="left", font=ctk.CTkFont(family=MONO, size=12),
                                   text_color=COLORS["text"])
-        self.stats.pack(padx=20, pady=(12, 2), anchor="w")
-        self.verdict = ctk.CTkLabel(card, text="", font=font(14, "bold"),
-                                    text_color=COLORS["text_muted"])
-        self.verdict.pack(padx=20, pady=(0, 8), anchor="w")
+        self.stats.pack(padx=20, pady=(12, 0))
+        self.verdict = ctk.CTkLabel(card, text=" ", width=480, height=28, anchor="w",
+                                    font=font(14, "bold"), text_color=COLORS["text_muted"])
+        self.verdict.pack(padx=20, pady=(0, 6))
 
         bar = ctk.CTkFrame(card, fg_color="transparent")
         bar.pack(pady=(4, 16))
@@ -972,9 +1054,12 @@ class CameraLab(ctk.CTkToplevel):
         self._w_cam = self.stream.count if self.stream else 0
         self._w_draws, self._w_ms, self._w_worst = 0, 0.0, 0.0
 
+    def _show(self, stats, verdict="", color=None):
+        self.stats.configure(text=stats)
+        self.verdict.configure(text=verdict or " ", text_color=color or COLORS["text_muted"])
+
     def _schedule_restart(self):
-        self.stats.configure(text="Opening camera...")
-        self.verdict.configure(text="")
+        self._show("Opening camera...")
         if self._restart_job:
             self.after_cancel(self._restart_job)
         self._restart_job = self.after(50, self._restart)
@@ -985,45 +1070,44 @@ class CameraLab(ctk.CTkToplevel):
             return
         if self.stream:
             self.stream.close()
-            self.stream = None
         w, h, fps = self._settings()
-        self.stream = CameraStream(self.index, w, h, fps)
-        self._last_count = -1
-        if not self.stream.ok:
-            self.stats.configure(text="Camera not found")
-            return
-        self._reset_stats()
+        self.stream = CameraStream(self.index, w, h, fps)    # returns instantly now
+        self._ready_seen, self._last_count = False, -1
 
     def _tick(self):
         if self.closed:
             return
         t0 = time.monotonic()
         s, fps = self.stream, self._settings()[2]
-        if s and s.ok and s.count != self._last_count:
-            frame = s.latest()
-            if frame is not None:
-                self._last_count = s.count
-                paint_preview(frame, self._tkimg, self.PW, self.PH, fast=not self.heavy_var.get())
-                cost = (time.monotonic() - t0) * 1000
-                self._w_draws += 1
-                self._w_ms += cost
-                self._w_worst = max(self._w_worst, cost)
-
-        dt = time.monotonic() - self._w_start
-        if s and s.ok and dt >= 1.0:
-            cam_fps = (s.count - self._w_cam) / dt
-            draws = self._w_draws / dt
-            avg = self._w_ms / self._w_draws if self._w_draws else 0.0
-            cpu = (time.process_time() - self._w_cpu) / dt * 100
-            self.stats.configure(text=(
-                f"Camera delivers    {cam_fps:4.1f} fps\n"
-                f"Preview draws     {draws:4.1f} fps   (avg {avg:.0f} ms, worst {self._w_worst:.0f} ms)\n"
-                f"App CPU use        {cpu:3.0f}% of one core"))
-            smooth = (cam_fps >= 0.8 * fps and draws >= 0.8 * fps and avg < 0.6 * (1000 / fps))
-            self.verdict.configure(
-                text="✔ Smooth" if smooth else "✖ Choppy - try a lower setting",
-                text_color=COLORS["success"] if smooth else COLORS["warning"])
-            self._reset_stats()
+        if s is not None and s.state == "failed":
+            self._show("Camera not found")
+        elif s is not None and s.ready:
+            if not self._ready_seen:                 # start measuring only once it's really running
+                self._ready_seen = True
+                self._reset_stats()
+            if s.count != self._last_count:
+                frame = s.latest()
+                if frame is not None:
+                    self._last_count = s.count
+                    paint_preview(frame, self._tkimg, self.PW, self.PH, fast=not self.heavy_var.get())
+                    cost = (time.monotonic() - t0) * 1000
+                    self._w_draws += 1
+                    self._w_ms += cost
+                    self._w_worst = max(self._w_worst, cost)
+            dt = time.monotonic() - self._w_start
+            if dt >= 1.0:
+                cam_fps = (s.count - self._w_cam) / dt
+                draws = self._w_draws / dt
+                avg = self._w_ms / self._w_draws if self._w_draws else 0.0
+                cpu = (time.process_time() - self._w_cpu) / dt * 100
+                smooth = (cam_fps >= 0.8 * fps and draws >= 0.8 * fps and avg < 0.6 * (1000 / fps))
+                self._show(
+                    f"Camera delivers  {cam_fps:5.1f} fps\n"
+                    f"Preview draws    {draws:5.1f} fps   avg {avg:.0f} ms   worst {self._w_worst:.0f} ms\n"
+                    f"App CPU use      {cpu:5.0f} % of one core",
+                    "✔ Smooth" if smooth else "✖ Choppy - try a lower setting",
+                    COLORS["success"] if smooth else COLORS["warning"])
+                self._reset_stats()
         spent = int((time.monotonic() - t0) * 1000)
         self._tick_job = self.after(max(15, int(500 / fps) - spent), self._tick)
 

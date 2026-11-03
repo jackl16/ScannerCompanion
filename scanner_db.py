@@ -119,6 +119,7 @@ class ScannerDB:
 
         self._students_cache = []
         self._students_cache_time = 0
+        self._students_refreshing = False
         self._cache_ttl_seconds = 60  # refresh student list at most once a minute
 
         scanner_cfg = config.get("scanner", {})
@@ -421,6 +422,35 @@ class ScannerDB:
             self._students_cache_time = 0
             student = self.find_student(code)
         return student
+
+
+    def get_students_fast(self):
+        """Cached list right away, even if it's older than the TTL; an old cache is refreshed on a
+        background thread so a scan never waits on the network. Only the very first load blocks."""
+        if not self._students_cache:
+            return self.get_students()
+        if (time.monotonic() - self._students_cache_time > self._cache_ttl_seconds
+                and not self._students_refreshing):
+            self._students_refreshing = True
+            threading.Thread(target=self._refresh_students_bg, daemon=True).start()
+        return self._students_cache
+
+    def _refresh_students_bg(self):
+        try:
+            resp = (self.client.table("students").select("*")
+                    .eq("center_id", self.center_id).execute())
+            self._students_cache = resp.data
+            self._students_cache_time = time.monotonic()
+        except Exception:
+            pass                     # keep serving the old list; the next scan tries again
+        finally:
+            self._students_refreshing = False
+
+    def find_student_quick(self, code: str) -> dict | None:
+        for s in self.get_students_fast():
+            if str(s.get("barcode_code", "")).strip() == code:
+                return s
+        return None
 
     @staticmethod
     def is_withdrawn(student: dict) -> bool:

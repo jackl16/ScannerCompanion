@@ -336,6 +336,7 @@ class ScannerApp(ctk.CTk):
         self._photo_busy = False
         self.photo_worker = None
         self.camera_stream = None
+        self._drive_connecting = False
 
         self.scan_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -832,6 +833,12 @@ class ScannerApp(ctk.CTk):
                         self.photo_browser.on_uploaded(port, payload)
                     from photo_capture import Toast
                     Toast(self, f"Uploaded ✓  {payload}")
+                elif kind == "drive_ready":
+                    self._on_drive_ready(payload)
+                elif kind == "drive_failed":
+                    self._drive_connecting = False
+                    log.warning("Drive connect failed: %s", payload)
+                    self._log(f"Couldn't connect to Google Drive: {payload}")
                 elif kind == "test_result":
                     self._testing = False
                     if self._widget_alive("status_label"):
@@ -936,11 +943,17 @@ class ScannerApp(ctk.CTk):
     def _on_photo_mode_toggled(self):
         enabled = self.photo_mode_var.get()
         if enabled:
-            if not messagebox.askyesno(
+            ok = messagebox.askyesno(
                 "Photo Capture Mode",
                 "While this is on, scans will NOT check students in or out.\n"
-                "They will only open the camera for that student.\n\nTurn it on?"
-            ) or not self._ensure_photo_backend():
+                "They will only open the camera for that student.\n\nTurn it on?")
+            if ok and self.photo_worker is None:
+                from photo_capture import has_saved_login
+                if has_saved_login():
+                    self._connect_drive_bg()          # no freeze
+                else:
+                    ok = self._ensure_photo_backend() # first-time sign-in, needs the browser
+            if not ok:
                 self._release_camera()
                 self.photo_mode_var.set(False)
                 enabled = False
@@ -949,7 +962,7 @@ class ScannerApp(ctk.CTk):
         self._refresh_mode_indicator()
         self._log("📷 Photo mode ON - scans find students for photos, no check-in/out" if enabled
                   else "Photo mode OFF - scans check students in/out")
-        if enabled: 
+        if enabled:
             self.after(200, self._get_camera)
 
     def _widget_alive(self, name):
@@ -964,6 +977,7 @@ class ScannerApp(ctk.CTk):
             self.hero.pack_forget()
             self._ensure_photo_widgets()
             self.photo_browser.pack(fill="both", expand=True, padx=20, pady=(8, 0), before=self.log_frame)
+            self._connect_drive_bg()
             self.after(300, self.photo_browser.refresh_if_stale)
             self.log_frame.pack(fill="both", expand=False, padx=20, pady=(8, 12))
             self.log_list.configure(height=130)
@@ -1008,10 +1022,42 @@ class ScannerApp(ctk.CTk):
             out[sid] = (name, str(s.get("barcode_code", "")), schedule.get(sid, set()), set(student_subjects(s)))
         return out
 
+
+    def _connect_drive_bg(self):
+        """Connects to Drive on a background thread so turning photo mode on never freezes the window.
+        Only when a saved login exists; the first-time sign-in needs the browser and dialogs."""
+        if self.photo_worker is not None or self._drive_connecting:
+            return
+        from photo_capture import has_saved_login
+        if not has_saved_login():
+            return
+        self._drive_connecting = True
+
+        def work():
+            try:
+                from photo_capture import DriveStore
+                self.scan_queue.put(("drive_ready", "", DriveStore()))
+            except Exception as e:
+                self.scan_queue.put(("drive_failed", "", str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_drive_ready(self, store):
+        self._drive_connecting = False
+        if self.photo_worker is None:
+            from photo_capture import UploadWorker
+            self.photo_worker = UploadWorker(
+                store, on_uploaded=lambda sid, subj: self.scan_queue.put(("photo_uploaded", sid, subj)))
+            self._retry_pending_photos(force=True)
+        if self._widget_alive("photo_browser"):
+            self.photo_browser.refresh_if_stale()
+
     def _ensure_photo_backend(self) -> bool:
         """Connects to Google Drive the first time it's needed (may open a browser to sign in)."""
         if self.photo_worker is not None:
             return True
+        if self._drive_connecting:
+            return False
         try:
             from photo_capture import DriveStore, UploadWorker, has_saved_login
             if not has_saved_login():
@@ -1042,7 +1088,7 @@ class ScannerApp(ctk.CTk):
             return
 
         try:
-            student = self.db.find_student_fresh(code)
+            student = self.db.find_student_quick(code) or self.db.find_student_fresh(code)
         except Exception as e:
             self._play_feedback_sound(is_success=False)
             self.status_label.config(text=f"Lookup failed: {e}", fg=COLORS["error"])
@@ -1059,7 +1105,7 @@ class ScannerApp(ctk.CTk):
 
     def _take_photo_for(self, sid):
         """Called by the photo browser's right-click menu."""
-        for s in self.db.get_students():
+        for s in self.db.get_students_fast():
             if str(s.get("s_id")) == str(sid):
                 self._start_photo_for_student(s)   # handles busy, inactive/withdrawn, no subjects
                 return
@@ -1076,9 +1122,13 @@ class ScannerApp(ctk.CTk):
             self.status_label.config(text=msg, fg=COLORS["error"])
             self._log(msg)
             return
+        if self._drive_connecting:
+            self.status_label.config(text="Still connecting to Google Drive...", fg=COLORS["warning"])
+            return
         if not self._ensure_photo_backend():
             return
 
+        t_start = time.monotonic()
         from photo_capture import PhotoDialog, folder_tags, student_photo_info
 
         try:
@@ -1095,13 +1145,6 @@ class ScannerApp(ctk.CTk):
             msg = f"{label}: no Math or Reading marked"
             self.status_label.config(text=msg, fg=COLORS["warning"])
             self._log(msg)
-            return
-
-        if not self._get_camera().ok:
-            self._release_camera()
-            self._play_feedback_sound(is_success=False)
-            messagebox.showerror("Camera", "Camera not found. Check the cable, or pick another "
-                                           "under Settings > Choose Camera.")
             return
 
         self._play_feedback_sound(is_success=True)
@@ -1121,6 +1164,14 @@ class ScannerApp(ctk.CTk):
             def open_dialog():
                 def done(jpeg, again=False):
                     nonlocal taken
+                    s = self.camera_stream
+                    if not jpeg and s is not None and s.state == "failed":
+                        steps.clear()                    # no camera: don't ask for the other photos
+                        self._release_camera()
+                        messagebox.showerror("Camera", "Camera not found. Check the cable, or pick another "
+                                                       "under Settings > Choose Camera.")
+                        next_step()                      # steps is empty, so this just resets the status
+                        return
                     if jpeg:
                         taken += 1
                         self.photo_worker.submit(info["id"], info["last"], info["first"],
@@ -1137,6 +1188,7 @@ class ScannerApp(ctk.CTk):
                 subtitle = f"Step {step_no} of {total}"
                 if taken:
                     subtitle += f"  •  photo {taken + 1}"
+                t_dlg = time.monotonic()
                 try:
                     PhotoDialog(
                         self, label, done,
@@ -1145,12 +1197,14 @@ class ScannerApp(ctk.CTk):
                         theme={"colors": COLORS, "font": FONT},
                         zoom=self.db.camera_zoom, on_zoom=self.db.save_camera_zoom,
                     )
+                    log.info("PhotoDialog built in %.0f ms", (time.monotonic() - t_dlg) * 1000)
                 except Exception as e:
                     self._photo_busy = False
                     self._log(f"Camera error: {e}")
 
             open_dialog()
 
+        log.info("Photo flow: setup took %.0f ms", (time.monotonic() - t_start) * 1000)
         next_step()
 
     def _on_tk_error(self, exc, val, tb):
@@ -1257,12 +1311,13 @@ class ScannerApp(ctk.CTk):
                     return "in use right now (skipped)"
                 s = self.camera_stream
                 if s is not None:
+                    if s.state == "failed":
+                        raise RuntimeError("the camera could not be opened")
                     if s.latest() is None:
-                        raise RuntimeError("camera open but no frames yet")
+                        raise RuntimeError("camera still starting, try again in a moment")
                     return "streaming"
                 if not test_camera(self.db.camera_index):
                     raise RuntimeError("no image from the selected camera")
-
             check("Google Drive", drive)
             check("Camera", camera)
 
