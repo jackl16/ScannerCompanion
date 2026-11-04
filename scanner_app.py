@@ -332,10 +332,12 @@ class ScannerApp(ctk.CTk):
         set_log_style(self.db.log_pills, self.db.log_terminal)
 
         self.photo_mode_var = tk.BooleanVar(value=self.db.photo_mode)
+        self._photo_log_h = 150
         self._photo_toggle_added = False
         self._photo_busy = False
         self.photo_worker = None
         self.camera_stream = None
+        
         self._drive_connecting = False
         self._merging = False
 
@@ -997,18 +999,25 @@ class ScannerApp(ctk.CTk):
             self.hero.pack_forget()
             self._ensure_photo_widgets()
             self.photo_browser.pack(fill="both", expand=True, padx=20, pady=(8, 0), before=self.log_frame)
+            self._ensure_log_handle()
             self._connect_drive_bg()
             self.after(300, self.photo_browser.refresh_if_stale)
-            self.log_frame.pack(fill="both", expand=False, padx=20, pady=(8, 12))
-            self.log_list.configure(height=130)
+            self.log_frame.pack(fill="x", expand=False, padx=20, pady=(0, 12))
+            self.log_frame.pack_propagate(False)
+            self.log_frame.configure(height=self._photo_log_h)
             self.resizable(True, True)
             self.minsize(960, 640)
-            self.geometry("960x760")
+            w = min(1180, self.winfo_screenwidth() - 80)
+            h = min(800, self.winfo_screenheight() - 120)
+            self.geometry(f"{w}x{h}")
         else:
             self.mode_label.config(text="")
             if self._widget_alive("photo_browser"):
                 self.photo_browser.pack_forget()
+            if self._widget_alive("log_handle"):
+                self.log_handle.pack_forget()
             self.hero.pack(fill="x", padx=20, pady=(16, 8), before=self.info_row)
+            self.log_frame.pack_propagate(True)            
             self.log_frame.pack(fill="both", expand=True, padx=20, pady=(8, 16))
             self.log_list.configure(height=220)
             self.minsize(1, 1)
@@ -1018,6 +1027,48 @@ class ScannerApp(ctk.CTk):
     def _ensure_photo_widgets(self):
         if not self._widget_alive("photo_browser"):
             self._build_photo_browser()
+
+    def _ensure_log_handle(self):
+        """Thin grip between the photo browser and the scan log; drag up/down to resize the log."""
+        if not self._widget_alive("log_handle"):
+            h = tk.Frame(self, height=12, bg=COLORS["bg"], cursor="sb_v_double_arrow")
+            grip = tk.Frame(h, height=3, width=64, bg="#52525b", cursor="sb_v_double_arrow")
+            grip.place(relx=0.5, rely=0.5, anchor="center")
+            for w in (h, grip):
+                w.bind("<ButtonPress-1>", self._log_drag_start)
+                w.bind("<B1-Motion>", self._log_drag_move)
+                w.bind("<ButtonRelease-1>", self._log_drag_end)
+            self.log_handle = h
+        self.log_handle.pack(fill="x", padx=20, before=self.log_frame)
+
+    def _log_drag_start(self, e):
+        self._drag_y0 = e.y_root
+        self._drag_h0 = self._photo_log_h
+        self._drag_handle_y = self.log_handle.winfo_y()
+        self._drag_new_h = self._photo_log_h
+        self._drag_line = tk.Frame(self, height=3, bg=COLORS["primary"])
+        self._drag_line.place(x=20, y=self._drag_handle_y + 4,
+                              width=self.winfo_width() - 40)
+        self._drag_line.lift()
+
+    def _log_drag_move(self, e):
+        line = getattr(self, "_drag_line", None)
+        if line is None:
+            return
+        room = self.winfo_height() - 400                      # keep the browser usable
+        new = self._drag_h0 + (self._drag_y0 - e.y_root)      # drag up = taller log
+        self._drag_new_h = int(max(80, min(room, new)))
+        # only the ghost line moves while dragging, which is cheap
+        line.place_configure(y=self._drag_handle_y + 4 + (self._drag_h0 - self._drag_new_h))
+
+    def _log_drag_end(self, e):
+        line = getattr(self, "_drag_line", None)
+        if line is None:
+            return
+        line.destroy()
+        self._drag_line = None
+        self._photo_log_h = self._drag_new_h
+        self.log_frame.configure(height=self._photo_log_h)    # one real resize on release
 
     def _build_photo_browser(self):
         from photo_capture import PhotoBrowser

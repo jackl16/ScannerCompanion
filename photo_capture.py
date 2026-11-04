@@ -1409,14 +1409,13 @@ class PhotoBrowser(ctk.CTkFrame):
         # draggable divider between the student list and the preview
         self.panes = tk.PanedWindow(self, orient="horizontal", sashwidth=10, sashrelief="flat",
                                     sashcursor="sb_h_double_arrow", bg=COLORS["bg"], bd=0,
-                                    opaqueresize=True)
+                                    opaqueresize=False)
         self.panes.grid(row=0, column=0, sticky="nsew")
 
         # left card: folder tree
         left = ctk.CTkFrame(self.panes, fg_color=COLORS["card"], corner_radius=12,
                             border_width=1, border_color=COLORS["border"])
-        self.panes.add(left, minsize=int(340 * self._pill_scale),
-                       width=int(450 * self._pill_scale), stretch="never")
+        self.panes.add(left, minsize=int(460 * self._pill_scale), stretch="never")
         bar = ctk.CTkFrame(left, fg_color="transparent")
         bar.pack(fill="x", padx=12, pady=(12, 0))
         ctk.CTkLabel(bar, text="STUDENT PHOTOS", font=font(11, "bold"),
@@ -1475,10 +1474,10 @@ class PhotoBrowser(ctk.CTkFrame):
         self.tree = ttk.Treeview(box, columns=("last",), show="tree headings",
                                  selectmode="browse", height=6)
         self.tree.heading("#0", text="Days · Subjects  /  Student", anchor="w")
-        self.tree.column("#0", width=350, stretch=True)
+        self.tree.column("#0", width=350, minwidth=200, stretch=True)
         self.tree.heading("last", text="Last photo", anchor="e")
         scale = max(self.winfo_fpixels("1i") / 96, 1.0)
-        self.tree.column("last", width=int(130 * scale), anchor="e", stretch=False)
+        self.tree.column("last", width=int(150 * scale), anchor="e", stretch=False)
         self.tree.tag_configure("warn", foreground=COLORS["warning"])
         self.tree.tag_configure("stale", foreground=COLORS["error"])
         sb = ctk.CTkScrollbar(box, command=self.tree.yview, width=12, fg_color=COLORS["card"],
