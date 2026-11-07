@@ -55,6 +55,7 @@ DEFAULT_THEME = {
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]  # app can only touch files it created
 ROOT_NAME = "Student Book Photos"
+EL_ROOT_NAME = "EL Student Book Photos"
 KEEP_COPIES = 1000          # per student; 
 CONFIRM_PHOTO = True     # toggle: preview + keep/retake before saving
 CAMERA_INDEX = 0
@@ -172,6 +173,7 @@ class DriveStore:
         self._cache = {}  # key -> (folder_id, name): saves Drive round trips
         self.svc = build("drive", "v3", credentials=self._creds(), cache_discovery=False)
         self.root_id = self._find_or_create("__root__", ROOT_NAME, None)
+        self.el_root_id = self._find_or_create("__el_root__", EL_ROOT_NAME, None)
 
     @staticmethod
     def _creds():
@@ -200,7 +202,8 @@ class DriveStore:
 
     def _find_or_create(self, key, name, parent):
         """Folders are found by a hidden property (the StudentID), not by name, so renames are safe."""
-        cached = self._cache.get(key)
+        ck = (key, parent)
+        cached = self._cache.get(ck)
         if cached and cached[1] == name:
             return cached[0]
         q = (f"appProperties has {{ key='kt_key' and value='{key}' }} "
@@ -212,25 +215,27 @@ class DriveStore:
             f = hits[0]
             if f["name"] != name:  # name changed in the database -> rename the folder
                 self.svc.files().update(fileId=f["id"], body={"name": name}).execute()
-            self._cache[key] = (f["id"], name)
+            self._cache[ck] = (f["id"], name)
             return f["id"]
         body = {"name": name, "mimeType": FOLDER_MIME, "appProperties": {"kt_key": key}}
         if parent:
             body["parents"] = [parent]
         fid = self.svc.files().create(body=body, fields="id").execute()["id"]
-        self._cache[key] = (fid, name)
+        self._cache[ck] = (fid, name)
         return fid
 
     def upload(self, *args, **kwargs):
         with self._lock:
             return self._upload(*args, **kwargs)
 
-    def _upload(self, student_id, last, first, subject, jpeg, barcode=None, taken_at=None):
+    def _upload(self, student_id, last, first, subject, jpeg, barcode=None, taken_at=None, is_el=False):
         """Saves straight into <root>/<First, Last (ID)>/ and keeps only the newest N photos per student.
         `subject` (for example "Math - Planning") goes on the end of the file name as a label."""
         try:
             label = student_id
-            student = self._find_or_create(f"student:{student_id}", f"{first}, {last} ({label})", self.root_id)
+            # Choose the root folder based on whether the student is EL
+            parent_root = self.el_root_id if is_el else self.root_id
+            student = self._find_or_create(f"student:{student_id}", f"{first}, {last} ({label})", parent_root)
             stamp = datetime.fromtimestamp(taken_at) if taken_at else datetime.now()
             tag = re.sub(r"[^A-Za-z0-9]+", "-", str(subject)).strip("-")
             name = stamp.strftime("%Y-%m-%d_%H-%M-%S") + (f"_{tag}" if tag else "") + ".jpg"
@@ -307,7 +312,7 @@ class DriveStore:
                 ).execute()
         return newest
         
-    def merge_subject_folders(self, progress=None, cancel=None):
+    def merge_subject_folders(self,is_el_check = None, progress=None, cancel=None):
         """One-time tidy-up: moves every photo out of the per-subject folders into the student's main
         folder (adding the old folder name to the end of the file name, after the date) and trashes the
         emptied folders. Safe to stop and re-run. Returns a dict of counts."""
@@ -327,13 +332,44 @@ class DriveStore:
                 if not token:
                     return
 
-        stats = dict(students=0, moved=0, folders_removed=0, folders_kept=0, failed=0)
-        students = [f for f in list_all(f"'{self.root_id}' in parents and mimeType='{FM}' and trashed=false",
-                                        "id,name,appProperties")
-                    if re.fullmatch(r"student:[^:]+", (f.get("appProperties") or {}).get("kt_key", ""))]
-        for n, st in enumerate(students, 1):
+        stats = dict(students=0, moved=0, folders_removed=0, folders_kept=0, failed=0, root_moved=0)
+
+        student_files = []
+        for root_id in [self.root_id, self.el_root_id]:
+            for f in list_all(f"'{root_id}' in parents and mimeType='{FM}' and trashed=false", "id,name,appProperties,parents"):
+                props = f.get("appProperties") or {}
+                if re.fullmatch(r"student:[^:]+", props.get("kt_key", "")):
+                    student_files.append((f, root_id))
+
+        # students = [f for f in list_all(f"'{self.root_id}' in parents and mimeType='{FM}' and trashed=false",
+        #                                 "id,name,appProperties")
+        #             if re.fullmatch(r"student:[^:]+", (f.get("appProperties") or {}).get("kt_key", ""))]
+        for n, (st,current_root) in enumerate(student_files, 1):
             if cancel is not None and cancel.is_set():
                 break
+
+            props = st.get("appProperties") or {}
+            kt_key = props.get("kt_key", "")
+            sid = kt_key.split(":")[1] if ":" in kt_key else None
+
+            # Determine correct root based on EL status
+            is_el = is_el_check(sid) if is_el_check and sid else (current_root == self.el_root_id)
+            target_root = self.el_root_id if is_el else self.root_id
+
+            # If student folder is in the wrong root folder, move it
+            if current_root != target_root:
+                try:
+                    call(self.svc.files().update(
+                        fileId=st["id"],
+                        addParents=target_root,
+                        removeParents=current_root,
+                        fields="id"
+                    ))
+                    stats["root_moved"] += 1
+                except Exception as e:
+                    stats["failed"] += 1
+                    log.warning("Couldn't move student folder %s to target root: %s", st["name"], e)
+
             subs = list(list_all(f"'{st['id']}' in parents and mimeType='{FM}' and trashed=false", "id,name"))
             if not subs:
                 continue
@@ -363,7 +399,7 @@ class DriveStore:
                     stats["failed"] += 1
                     log.warning("Couldn't remove folder %s: %s", sub["name"], e)
             if progress:
-                progress(f"Tidying photo folders: student {n} of {len(students)}...")
+                progress(f"Tidying photo folders: student {n} of {len(student_files)}...")
         self._cache.clear()
         return stats
 
@@ -1226,8 +1262,8 @@ class UploadWorker(threading.Thread):
         self._queued_paths = set()   # pending files already waiting in the queue
         self.start()
 
-    def submit(self, student_id, last, first, subject, jpeg, barcode=None):
-        self.q.put((student_id, last, first, subject, jpeg, barcode, time.time(), None))
+    def submit(self, student_id, last, first, subject, jpeg, barcode=None, is_el=False):
+        self.q.put((student_id, last, first, subject, jpeg, barcode, time.time(), None, is_el))
 
     def stop(self):
         self.q.put(None)   # finish what's queued, then exit
@@ -1245,16 +1281,16 @@ class UploadWorker(threading.Thread):
             try:
                 sid, rest = fn[:-4].split("_", 1)           # <student id>_<subject>_<unix time>.jpg
                 subject, ts = rest.rsplit("_", 1)
-                names = lookup_names(sid)
+                names = lookup_names(sid)            # now returns (last, first, is_el)
                 if names is None:
-                    continue                                  # unknown student: leave the file alone
-                last, first = names
+                    continue
+                last, first, is_el = names
                 taken_at = int(ts)
             except Exception:
                 log.warning("Skipping unrecognised pending file: %s", fn)
                 continue
             self._queued_paths.add(path)
-            self.q.put((sid, last, first, subject, None, None, taken_at, path))   # jpeg read in the worker
+            self.q.put((sid, last, first, subject, None, None, taken_at, path, is_el))
             n += 1
         if n:
             log.info("Queued %d pending photo(s) for retry", n)
@@ -1273,13 +1309,13 @@ class UploadWorker(threading.Thread):
                 self.q.task_done()
 
     def _handle(self, job):
-        sid, last, first, subject, jpeg, barcode, taken_at, src = job
+        sid, last, first, subject, jpeg, barcode, taken_at, src, is_el = job
         if jpeg is None:
             with open(src, "rb") as f:
                 jpeg = f.read()
         for attempt in range(3):
             try:
-                self.store.upload(sid, last, first, subject, jpeg, barcode, taken_at)
+                self.store.upload(sid, last, first, subject, jpeg, barcode, taken_at, is_el=is_el)
                 log.info("Uploaded %s photo for student %s", subject, sid)
                 if src:
                     self._queued_paths.discard(src)
@@ -1335,12 +1371,15 @@ def student_photo_info(row: dict) -> dict:
     if MATH_COL not in cols and READING_COL not in cols:
         raise KeyError(f"Math/Reading columns not found; students table has: {sorted(row)}")
     subjects = student_subjects(row)
+    el_val = row.get("el")
+    is_el = bool(el_val and str(el_val).strip() not in ("", "None", "NULL"))
     return {
         "id": str(row["s_id"]),
         "barcode": str(row.get(BARCODE_COL, "")),
         "first": row[FIRST_COL],
         "last": row[LAST_COL],
         "subjects": subjects,
+        "is_el": is_el,
         "steps": [(f"{s} - {kind}", multi) for s in subjects for kind, multi in SHOT_TYPES],
     }
 
@@ -1593,18 +1632,21 @@ class PhotoBrowser(ctk.CTkFrame):
     def _fetch_root(self, store):
         visible = self.get_visible_students() 
         rows, last, missing, seen = [], {}, [], set()
-        for f in store.list_children(store.root_id, folders_only=True):
-            props = f.get("appProperties") or {}
-            key = props.get("kt_key", "").split(":")
-            if len(key) == 2 and key[0] == "student" and key[1] in visible:
-                sid = key[1]
-                seen.add(sid)
-                rows.append((visible[sid][0], f["id"], sid))
-                dt = self._parse_last(props.get(LAST_KEY))
-                if dt:
-                    last[sid] = dt
-                else:
-                    missing.append((sid, f["id"]))
+        # Check both the regular root folder and the EL root folder for student subfolders
+        parent_folders = [store.root_id, store.el_root_id]
+        for parent_id in parent_folders:
+            for f in store.list_children(parent_id, folders_only=True):
+                props = f.get("appProperties") or {}
+                key = props.get("kt_key", "").split(":")
+                if len(key) == 2 and key[0] == "student" and key[1] in visible:
+                    sid = key[1]
+                    seen.add(sid)
+                    rows.append((visible[sid][0], f["id"], sid))
+                    dt = self._parse_last(props.get(LAST_KEY))
+                    if dt:
+                        last[sid] = dt
+                    else:
+                        missing.append((sid, f["id"]))
         for sid, info in visible.items():      # no Drive folder yet = never photographed
             if sid not in seen:
                 rows.append((info[0], None, sid))
@@ -1676,6 +1718,7 @@ class PhotoBrowser(ctk.CTkFrame):
             self._loaded_at = time.monotonic()
             self._days = {sid: v[2] for sid, v in visible.items()}
             self._subjects = {sid: v[3] for sid, v in visible.items()}
+            self._els = {sid: v[4] for sid, v in visible.items()}
             self._search = {sid: f"{v[0]} {v[1]} {self._days_text(sid)} {' '.join(sorted(v[3]))}".lower()
                             for sid, v in visible.items()}
             #self._pill_slots = max([MIN_PILLS] + [len(v[2]) for v in visible.values()])

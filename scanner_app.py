@@ -852,8 +852,10 @@ class ScannerApp(ctk.CTk):
                         self.status_label.config(text=payload, fg=COLORS["text_muted"])
                 elif kind == "merge_done":
                     self._merging = False
-                    msg = (f"Moved {payload['moved']} photo(s) for {payload['students']} student(s) and "
-                           f"removed {payload['folders_removed']} empty folder(s).")
+                    msg = (f"Migrated/tidied {payload['students']} student(s): "
+                            f"{payload['root_moved']} folder(s) moved between regular/EL roots, "
+                            f"{payload['moved']} photo(s) moved, and "
+                            f"{payload['folders_removed']} empty folder(s) removed.")
                     if payload["folders_kept"]:
                         msg += f"\n{payload['folders_kept']} folder(s) were kept because they hold something other than photos."
                     if payload["failed"]:
@@ -1081,7 +1083,7 @@ class ScannerApp(ctk.CTk):
         )
 
     def _visible_photo_students(self) -> dict:
-        """s_id -> (name, barcode, set of days), active students only."""
+        """s_id -> (name, barcode, set of days, subjects, is_el), active students only."""
         from photo_capture import student_subjects
         schedule = self.db.get_schedule_days()
         out = {}
@@ -1089,8 +1091,11 @@ class ScannerApp(ctk.CTk):
             if self.db.is_withdrawn(s):
                 continue
             sid = str(s["s_id"])
-            name = f"{s.get('first_name', '')} {s.get('last_name', '')}".strip()
-            out[sid] = (name, str(s.get("barcode_code", "")), schedule.get(sid, set()), set(student_subjects(s)))
+            name = f"{s.get('first_name', '')} {s.get('last_name', '')}".strip()   
+            # Check if EL field has a value (M, R, MR, etc.) and is not empty/null
+            el_val = s.get("el")
+            is_el = bool(el_val and str(el_val).strip() not in ("", "None", "NULL")) 
+            out[sid] = (name, str(s.get("barcode_code", "")), schedule.get(sid, set()), set(student_subjects(s)),is_el)
         return out
 
 
@@ -1246,7 +1251,7 @@ class ScannerApp(ctk.CTk):
                     if jpeg:
                         taken += 1
                         self.photo_worker.submit(info["id"], info["last"], info["first"],
-                                                 folder, jpeg, info["barcode"])
+                                                 folder, jpeg, info["barcode"], is_el=info["is_el"])
                         self._log(f"📷 {label}: {folder} photo {taken} captured, uploading")
                     else:
                         self._log(f"{label}: {folder} skipped")
@@ -1300,7 +1305,9 @@ class ScannerApp(ctk.CTk):
     def _student_names(self, sid):
         for s in self.db.get_students():
             if str(s.get("s_id")) == str(sid):
-                return s.get("last_name", ""), s.get("first_name", "")
+                el = s.get("el")
+                is_el = bool(el and str(el).strip() not in ("", "None", "NULL"))
+                return s.get("last_name", ""), s.get("first_name", ""), is_el
         return None
 
     def _pending_photo_count(self) -> int:
@@ -1447,16 +1454,20 @@ class ScannerApp(ctk.CTk):
             "This moves every student's photos out of their Math / Reading folders and into the "
             "student's main folder, then removes the empty folders (they go to the Drive trash).\n\n"
             "File names keep their date and gain the old folder name at the end.\n"
+            "EL Students are also sorted into their respective folders.\n"
             "It can take several minutes. You can keep using the app, and it is safe to close and "
             "run again.\n\nStart?"):
             return
         self._merging = True
-        self._log("🗂 Tidying photo folders...")
+        self._log("🗂 Tidying and migrating photo folders...")
         store = self.photo_worker.store
-
+        # detects the current students and which students are in EL
+        visible_students= self._visible_photo_students()
+        el_status_map = {sid: info[4] for sid, info in visible_students.items()}
         def work():
             try:
                 stats = store.merge_subject_folders(
+                    is_el_check=lambda sid: el_status_map.get(str(sid), False),
                     progress=lambda t: self.scan_queue.put(("merge_progress", "", t)))
                 self.scan_queue.put(("merge_done", "", stats))
             except Exception as e:
